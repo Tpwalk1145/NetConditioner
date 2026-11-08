@@ -28,10 +28,14 @@ public sealed class AppSettings
     /// </summary>
     public int MaxQueueDelayMs { get; set; } = 2000;
 
+    /// <summary>目标进程文件名（如 chrome.exe）。为空表示对所有进程生效（全局）。</summary>
+    public List<string> ProcessNames { get; set; } = new();
+
     public AppSettings Clone() => new()
     {
         MaxRunMinutes = MaxRunMinutes,
         MaxQueueDelayMs = MaxQueueDelayMs,
+        ProcessNames = new List<string>(ProcessNames ?? new List<string>()),
     };
 }
 

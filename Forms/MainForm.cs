@@ -50,6 +50,8 @@ public sealed class MainForm : Form
     private readonly Button _newButton = new();
     private readonly Button _editButton = new();
     private readonly Button _deleteButton = new();
+    private readonly TextBox _processScopeBox = new();
+    private readonly Button _processScopeButton = new();
     private readonly Button _toggleButton = new();
     private readonly Label _hotkeyLabel = new();
     private readonly LinkLabel _settingsLink = new();
@@ -77,7 +79,7 @@ public sealed class MainForm : Form
         SuspendLayout();
 
         Text = "弱网模拟器";
-        ClientSize = new Size(560, 540);
+        ClientSize = new Size(560, 574);
         FormBorderStyle = FormBorderStyle.FixedSingle;
         MaximizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
@@ -170,7 +172,31 @@ public sealed class MainForm : Form
         _deleteButton.Click += (_, _) => DeleteProfile();
         Controls.Add(_deleteButton);
 
-        _toggleButton.Location = new Point(20, 284);
+        Controls.Add(new Label
+        {
+            Text = "目标进程",
+            ForeColor = TextDark,
+            AutoSize = true,
+            Location = new Point(20, 284),
+        });
+
+        _processScopeBox.Location = new Point(84, 278);
+        _processScopeBox.Size = new Size(348, 27);
+        _processScopeBox.ReadOnly = true;
+        _processScopeBox.BackColor = Color.White;
+        Controls.Add(_processScopeBox);
+
+        _processScopeButton.Text = "选择进程…";
+        _processScopeButton.Location = new Point(440, 277);
+        _processScopeButton.Size = new Size(100, 30);
+        _processScopeButton.FlatStyle = FlatStyle.Flat;
+        _processScopeButton.BackColor = Color.White;
+        _processScopeButton.ForeColor = Color.FromArgb(60, 64, 67);
+        _processScopeButton.FlatAppearance.BorderColor = Color.FromArgb(200, 203, 207);
+        _processScopeButton.Click += (_, _) => SelectProcesses();
+        Controls.Add(_processScopeButton);
+
+        _toggleButton.Location = new Point(20, 318);
         _toggleButton.Size = new Size(520, 50);
         _toggleButton.FlatStyle = FlatStyle.Flat;
         _toggleButton.FlatAppearance.BorderSize = 0;
@@ -187,26 +213,26 @@ public sealed class MainForm : Form
             Text = "全局快捷键",
             ForeColor = TextMuted,
             AutoSize = true,
-            Location = new Point(20, 350),
+            Location = new Point(20, 384),
         });
 
         _hotkeyLabel.Text = "Ctrl + Alt + U";
         _hotkeyLabel.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
         _hotkeyLabel.ForeColor = TextDark;
         _hotkeyLabel.AutoSize = true;
-        _hotkeyLabel.Location = new Point(100, 350);
+        _hotkeyLabel.Location = new Point(100, 384);
         Controls.Add(_hotkeyLabel);
 
         _settingsLink.Text = "设置";
         _settingsLink.AutoSize = true;
-        _settingsLink.Location = new Point(486, 350);
+        _settingsLink.Location = new Point(486, 384);
         _settingsLink.LinkColor = Color.FromArgb(21, 101, 192);
         _settingsLink.Click += (_, _) => ChangeSettings();
         Controls.Add(_settingsLink);
 
         var statsCard = new Panel
         {
-            Location = new Point(20, 380),
+            Location = new Point(20, 414),
             Size = new Size(520, 58),
             BackColor = Card,
             BorderStyle = BorderStyle.FixedSingle,
@@ -230,15 +256,15 @@ public sealed class MainForm : Form
             Font = new Font("Microsoft YaHei UI", 8F),
             ForeColor = Color.FromArgb(126, 87, 0),
             AutoSize = false,
-            Location = new Point(20, 448),
+            Location = new Point(20, 482),
             Size = new Size(520, 28),
         });
 
-        ConfigureFooterButton(_minimizeButton, "最小化到托盘", new Point(20, 486), 140);
+        ConfigureFooterButton(_minimizeButton, "最小化到托盘", new Point(20, 520), 140);
         _minimizeButton.Click += (_, _) => HideToTray();
         Controls.Add(_minimizeButton);
 
-        ConfigureFooterButton(_exitButton, "退出", new Point(400, 486), 140);
+        ConfigureFooterButton(_exitButton, "退出", new Point(400, 520), 140);
         _exitButton.Click += (_, _) => ExitApp();
         Controls.Add(_exitButton);
 
@@ -410,6 +436,27 @@ public sealed class MainForm : Form
         }
     }
 
+    private void SelectProcesses()
+    {
+        if (_isRunning || _isBusy)
+            return;
+
+        using var dialog = new ProcessSelectorForm(_config.Settings.ProcessNames);
+        if (dialog.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        if (dialog.SelectedNames.Count > ProcessFlowFilter.MaxProcessCount)
+        {
+            MessageBox.Show(this, $"目标进程最多 {ProcessFlowFilter.MaxProcessCount} 个。", "目标进程",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
+        _config.Settings.ProcessNames = dialog.SelectedNames.ToList();
+        SaveConfig();
+        UpdateUi();
+    }
+
     private async Task ToggleAsync()
     {
         if (_isBusy)
@@ -457,12 +504,17 @@ public sealed class MainForm : Form
             }
         }
 
+        var processNames = _config.Settings.ProcessNames.ToList();
+        var maxQueueDelayMs = _config.Settings.MaxQueueDelayMs;
+
         _isBusy = true;
         UpdateUi();
         try
         {
             await Task.Run(() => _conditioner.Start(
-                profile, maxQueueDelayMs: _config.Settings.MaxQueueDelayMs));
+                profile,
+                maxQueueDelayMs: maxQueueDelayMs,
+                processNames: processNames));
             if (_exitRequested || IsDisposed || Disposing)
             {
                 _conditioner.Stop();
@@ -583,9 +635,7 @@ public sealed class MainForm : Form
             _toggleButton.Enabled = true;
             _statusDot.ForeColor = Green;
             _statusLabel.Text = $"已连接：{ActiveProfile?.Name ?? "配置"}";
-            _statusDetail.Text = ActiveProfile is { } active
-                ? $"弱网参数生效：{FormatProcessScope(active)}"
-                : "弱网参数正在全系统生效";
+            _statusDetail.Text = $"弱网参数生效：{FormatProcessScope(_config.Settings.ProcessNames)}";
         }
         else
         {
@@ -604,6 +654,8 @@ public sealed class MainForm : Form
         _newButton.Enabled = !_isRunning && !_isBusy;
         _editButton.Enabled = !_isBusy;
         _deleteButton.Enabled = !_isRunning && !_isBusy;
+        _processScopeButton.Enabled = !_isRunning && !_isBusy;
+        _processScopeBox.Text = FormatProcessNames(_config.Settings.ProcessNames);
         _settingsLink.Enabled = !_isBusy;
 
         if (_toggleMenuItem is not null)
@@ -870,9 +922,8 @@ public sealed class MainForm : Form
 
     private static bool IsRemoteSession() => GetSystemMetrics(0x1000) != 0;
 
-    private static string FormatProcessScope(NetworkProfile profile)
+    private static string FormatProcessScope(IReadOnlyList<string> names)
     {
-        var names = profile.ProcessNames;
         if (names is not { Count: > 0 })
             return "全部进程（全局）";
         if (names.Count == 1)
@@ -881,6 +932,11 @@ public sealed class MainForm : Form
             return string.Join("、", names);
         return $"{names[0]} 等 {names.Count} 个进程";
     }
+
+    private static string FormatProcessNames(IReadOnlyList<string> names) =>
+        names is { Count: > 0 }
+            ? string.Join(", ", names)
+            : "全部进程（全局）";
 
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int nIndex);

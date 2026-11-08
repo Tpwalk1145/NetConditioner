@@ -55,14 +55,8 @@ public sealed class NetworkProfile
     public DirectionProfile Downlink { get; set; } = new();
     public ConditionProtocol Protocol { get; set; } = ConditionProtocol.All;
 
-    /// <summary>目标进程文件名（如 chrome.exe）。为空表示对所有进程生效（全局）。</summary>
-    public List<string> ProcessNames { get; set; } = new();
-
     [JsonIgnore]
     public bool IsAllZero => Uplink.IsAllZero && Downlink.IsAllZero;
-
-    [JsonIgnore]
-    public bool IsGlobal => ProcessNames is not { Count: > 0 };
 
     public NetworkProfile Clone() => new()
     {
@@ -71,7 +65,6 @@ public sealed class NetworkProfile
         Uplink = Uplink.Clone(),
         Downlink = Downlink.Clone(),
         Protocol = Protocol,
-        ProcessNames = new List<string>(ProcessNames ?? new List<string>()),
     };
 
     public string? Validate()
@@ -80,8 +73,6 @@ public sealed class NetworkProfile
             return "配置名称不能为空。";
         if (Name.Length > 60)
             return "配置名称不能超过 60 个字符。";
-        if (ProcessNames is { Count: > 64 })
-            return "目标进程最多 64 个。";
         return Uplink.Validate("上行") ?? Downlink.Validate("下行");
     }
 

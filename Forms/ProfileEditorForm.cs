@@ -26,11 +26,8 @@ public sealed class ProfileEditorForm : Form
     private readonly NumericUpDown _downBurstAllow = CreateNumber(600_000, 10);
     private readonly NumericUpDown _downBurstDrop = CreateNumber(600_000, 10);
     private readonly ComboBox _protocolCombo = new();
-    private readonly TextBox _processBox = new();
-    private readonly Button _processButton = new();
 
     private NetworkProfile? _result;
-    private List<string> _processNames = new();
 
     public ProfileEditorForm(NetworkProfile? existing, IEnumerable<string> existingNames, bool allowDelete)
     {
@@ -41,7 +38,7 @@ public sealed class ProfileEditorForm : Form
         _allowDelete = allowDelete;
 
         Text = existing is null ? "新建配置" : "编辑配置";
-        ClientSize = new Size(760, 646);
+        ClientSize = new Size(760, 592);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
@@ -134,45 +131,20 @@ public sealed class ProfileEditorForm : Form
 
         Controls.Add(new Label
         {
-            Text = "目标进程",
-            ForeColor = TextDark,
-            AutoSize = true,
-            Location = new Point(20, 506),
-        });
-
-        _processBox.Location = new Point(100, 502);
-        _processBox.Size = new Size(480, 27);
-        _processBox.ReadOnly = true;
-        _processBox.BackColor = Color.White;
-        Controls.Add(_processBox);
-
-        _processButton.Text = "选择进程…";
-        _processButton.Location = new Point(590, 500);
-        _processButton.Size = new Size(150, 31);
-        _processButton.FlatStyle = FlatStyle.Flat;
-        _processButton.BackColor = Color.White;
-        _processButton.ForeColor = Color.FromArgb(60, 64, 67);
-        _processButton.FlatAppearance.BorderColor = Color.FromArgb(200, 203, 207);
-        _processButton.Click += (_, _) => SelectProcesses();
-        Controls.Add(_processButton);
-
-        Controls.Add(new Label
-        {
             Text = "带宽单位 kbps；随机丢包单位 %；延时 / 连续丢包单位 ms；0 表示不启用。\r\n" +
-                   "连续丢包：放行 X ms、丢包 Y ms 循环；只填“丢包”表示一直丢包。上行丢包/限速也会影响下载 ACK。\r\n" +
-                   "目标进程不选 = 全局；选择后仅对这些程序生效（同名多开实例都生效）。",
+                   "连续丢包：放行 X ms、丢包 Y ms 循环；只填“丢包”表示一直丢包。上行丢包/限速也会影响下载 ACK。",
             Font = new Font("Microsoft YaHei UI", 8F),
             ForeColor = TextMuted,
             AutoSize = false,
-            Location = new Point(20, 538),
-            Size = new Size(720, 58),
+            Location = new Point(20, 502),
+            Size = new Size(720, 38),
         });
 
         var cancelButton = new Button
         {
             Text = "取消",
             DialogResult = DialogResult.Cancel,
-            Location = new Point(520, 604),
+            Location = new Point(520, 548),
             Size = new Size(100, 30),
             FlatStyle = FlatStyle.Flat,
             BackColor = Color.White,
@@ -183,7 +155,7 @@ public sealed class ProfileEditorForm : Form
         var okButton = new Button
         {
             Text = "确定",
-            Location = new Point(630, 604),
+            Location = new Point(630, 548),
             Size = new Size(110, 30),
             FlatStyle = FlatStyle.Flat,
             BackColor = Accent,
@@ -201,7 +173,7 @@ public sealed class ProfileEditorForm : Form
             var deleteButton = new Button
             {
                 Text = "删除配置",
-                Location = new Point(20, 604),
+                Location = new Point(20, 548),
                 Size = new Size(110, 30),
                 FlatStyle = FlatStyle.Flat,
                 BackColor = Color.FromArgb(255, 235, 238),
@@ -240,7 +212,6 @@ public sealed class ProfileEditorForm : Form
         if (_existing is null)
         {
             _nameBox.Text = MakeDefaultName();
-            UpdateProcessSummary();
             return;
         }
 
@@ -253,27 +224,6 @@ public sealed class ProfileEditorForm : Form
             ConditionProtocol.Udp => 1,
             _ => 2,
         };
-        _processNames = new List<string>(_existing.ProcessNames ?? new List<string>());
-        UpdateProcessSummary();
-    }
-
-    private void SelectProcesses()
-    {
-        using var dialog = new ProcessSelectorForm(_processNames);
-        if (dialog.ShowDialog(this) != DialogResult.OK)
-            return;
-
-        _processNames = dialog.SelectedNames.ToList();
-        UpdateProcessSummary();
-    }
-
-    private void UpdateProcessSummary()
-    {
-        _processBox.Text = _processNames.Count == 0
-            ? "全部进程（全局）"
-            : string.Join(", ", _processNames);
-        _processBox.SelectionStart = 0;
-        _processBox.SelectionLength = 0;
     }
 
     private static void LoadDirection(
@@ -342,7 +292,6 @@ public sealed class ProfileEditorForm : Form
                 1 => ConditionProtocol.Udp,
                 _ => ConditionProtocol.All,
             },
-            ProcessNames = _processNames.ToList(),
         };
 
         var error = profile.Validate();

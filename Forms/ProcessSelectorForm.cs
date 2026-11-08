@@ -180,7 +180,18 @@ public sealed class ProcessSelectorForm : Form
             Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
             FlatAppearance = { BorderSize = 0 },
         };
-        okButton.Click += (_, _) => DialogResult = DialogResult.OK;
+        okButton.Click += (_, _) =>
+        {
+            if (_selected.Count > ProcessFlowFilter.MaxProcessCount)
+            {
+                MessageBox.Show(this,
+                    $"最多选择 {ProcessFlowFilter.MaxProcessCount} 个进程。", "选择目标进程",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            DialogResult = DialogResult.OK;
+        };
         Controls.Add(okButton);
 
         AcceptButton = okButton;

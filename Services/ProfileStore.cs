@@ -75,6 +75,7 @@ public sealed class ProfileStore
         config.Settings ??= new AppSettings();
         config.Settings.MaxRunMinutes = Math.Clamp(config.Settings.MaxRunMinutes, 0, 1440);
         config.Settings.MaxQueueDelayMs = Math.Clamp(config.Settings.MaxQueueDelayMs, 0, 60000);
+        config.Settings.ProcessNames = SanitizeProcessNames(config.Settings.ProcessNames);
 
         // 去掉明显损坏的配置项，并修正重复 Id。
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -97,7 +98,6 @@ public sealed class ProfileStore
 
             p.Uplink ??= new DirectionProfile();
             p.Downlink ??= new DirectionProfile();
-            p.ProcessNames = SanitizeProcessNames(p.ProcessNames);
             Clamp(p.Uplink);
             Clamp(p.Downlink);
         }
@@ -131,7 +131,7 @@ public sealed class ProfileStore
             }
 
             result.Add(name);
-            if (result.Count >= 64)
+            if (result.Count >= ProcessFlowFilter.MaxProcessCount)
                 break;
         }
 

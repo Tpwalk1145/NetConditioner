@@ -66,20 +66,22 @@ public static class SelfTest
             try
             {
                 var store = new ProfileStore(configPath);
-                var testConfig = new AppConfig();
-                testConfig.Profiles.Add(new NetworkProfile
+                var testConfig = new AppConfig
                 {
-                    Name = "process-config-test",
-                    ProcessNames = new List<string>
+                    Settings = new AppSettings
                     {
-                        "chrome.exe", @"C:\Tools\MyApp.EXE", "chrome.exe",
+                        ProcessNames = new List<string>
+                        {
+                            "chrome.exe", @"C:\Tools\MyApp.EXE", "chrome.exe",
+                        },
                     },
-                });
+                };
+                testConfig.Profiles.Add(new NetworkProfile { Name = "process-config-test" });
                 testConfig.ActiveProfileId = testConfig.Profiles[0].Id;
                 store.Save(testConfig);
 
                 var loaded = store.Load(out _);
-                var names = loaded.Profiles[0].ProcessNames;
+                var names = loaded.Settings.ProcessNames;
                 if (names.Count == 2 &&
                     names.Contains("chrome.exe") &&
                     names.Contains("myapp.exe"))
@@ -206,12 +208,13 @@ public static class SelfTest
                 Uplink = new DirectionProfile { DelayMs = 300 },
                 Downlink = new DirectionProfile(),
                 Protocol = ConditionProtocol.Tcp,
-                ProcessNames = new List<string> { selfName },
             };
 
             using (var conditioner = new NetworkConditioner())
             {
-                conditioner.Start(matchProcessProfile, outFilter, inFilter);
+                conditioner.Start(
+                    matchProcessProfile, outFilter, inFilter,
+                    processNames: new List<string> { selfName });
                 Thread.Sleep(200);
                 var delayedByProcess = MeasureEcho(port, 3, 5000);
                 if (delayedByProcess is null)
@@ -236,12 +239,13 @@ public static class SelfTest
                 Uplink = new DirectionProfile { DelayMs = 300 },
                 Downlink = new DirectionProfile(),
                 Protocol = ConditionProtocol.Tcp,
-                ProcessNames = new List<string> { "netconditioner-not-selected.exe" },
             };
 
             using (var conditioner = new NetworkConditioner())
             {
-                conditioner.Start(otherProcessProfile, outFilter, inFilter);
+                conditioner.Start(
+                    otherProcessProfile, outFilter, inFilter,
+                    processNames: new List<string> { "netconditioner-not-selected.exe" });
                 Thread.Sleep(200);
                 var passThrough = MeasureEcho(port, 3, 3000);
                 if (passThrough is null)
@@ -267,12 +271,13 @@ public static class SelfTest
                 Uplink = new DirectionProfile(),
                 Downlink = new DirectionProfile { DelayMs = 300 },
                 Protocol = ConditionProtocol.Tcp,
-                ProcessNames = new List<string> { selfName },
             };
 
             using (var conditioner = new NetworkConditioner())
             {
-                conditioner.Start(downProcessProfile, outFilter, loopbackDownFilter);
+                conditioner.Start(
+                    downProcessProfile, outFilter, loopbackDownFilter,
+                    processNames: new List<string> { selfName });
                 Thread.Sleep(200);
                 var delayedDownByProcess = MeasureEcho(port, 3, 5000);
                 if (delayedDownByProcess is null)
@@ -306,11 +311,12 @@ public static class SelfTest
                     Uplink = new DirectionProfile { DelayMs = 300 },
                     Downlink = new DirectionProfile(),
                     Protocol = ConditionProtocol.Tcp,
-                    ProcessNames = new List<string> { selfName },
                 };
 
                 using var conditioner = new NetworkConditioner();
-                conditioner.Start(ipv6Profile, outFilter6, inFilter6);
+                conditioner.Start(
+                    ipv6Profile, outFilter6, inFilter6,
+                    processNames: new List<string> { selfName });
                 Thread.Sleep(200);
                 var ipv6Ms = MeasureEcho(port6, 3, 5000, IPAddress.IPv6Loopback);
                 if (ipv6Ms is null)
@@ -348,11 +354,12 @@ public static class SelfTest
                     Uplink = new DirectionProfile { DelayMs = 300 },
                     Downlink = new DirectionProfile(),
                     Protocol = ConditionProtocol.Udp,
-                    ProcessNames = new List<string> { selfName },
                 };
 
                 using var conditioner = new NetworkConditioner();
-                conditioner.Start(udpProfile, udpOutFilter, udpInFilter);
+                conditioner.Start(
+                    udpProfile, udpOutFilter, udpInFilter,
+                    processNames: new List<string> { selfName });
                 Thread.Sleep(200);
                 var udpMs = MeasureUdpEcho(udpPort, 3, 5000);
                 if (udpMs is null)

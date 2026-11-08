@@ -35,12 +35,16 @@ public sealed class NetworkConditioner : IDisposable
         get { lock (_sync) return _downlink?.Stats; }
     }
 
-    /// <summary>启动弱网模拟。filter 参数仅供自测使用；正常启动使用全系统 TCP/UDP 过滤器。</summary>
+    /// <summary>
+    /// 启动弱网模拟。filter 参数用于自测；常规启动使用默认全系统过滤器。
+    /// processNames 为空表示对所有进程生效。
+    /// </summary>
     public void Start(
         NetworkProfile profile,
         string? outboundFilter = null,
         string? inboundFilter = null,
-        int maxQueueDelayMs = 2000)
+        int maxQueueDelayMs = 2000,
+        IReadOnlyList<string>? processNames = null)
     {
         ArgumentNullException.ThrowIfNull(profile);
 
@@ -50,8 +54,8 @@ public sealed class NetworkConditioner : IDisposable
                 throw new InvalidOperationException("弱网模拟已经在运行。");
 
             var snapshot = profile.Clone();
-            var processFilter = snapshot.ProcessNames is { Count: > 0 }
-                ? new ProcessFlowFilter(snapshot.ProcessNames)
+            var processFilter = processNames is { Count: > 0 }
+                ? new ProcessFlowFilter(processNames)
                 : null;
 
             var uplink = new DirectionEngine(

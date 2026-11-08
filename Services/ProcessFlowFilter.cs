@@ -110,6 +110,8 @@ internal static class PacketFlowReader
 /// </summary>
 internal sealed class ProcessFlowFilter : IDisposable
 {
+    public const int MaxProcessCount = 64;
+
     private const int RefreshIntervalMs = 2000;
     private static readonly long OnDemandIntervalTicks =
         Math.Max(1, (long)(Stopwatch.Frequency * 0.05));
