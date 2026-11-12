@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using NetConditioner.Services;
 
 namespace NetConditioner.Forms;
@@ -6,18 +7,25 @@ namespace NetConditioner.Forms;
 /// <summary>选择一个或多个目标进程；一个都不选表示对全部进程生效。</summary>
 public sealed class ProcessSelectorForm : Form
 {
+    private const int EmSetCueBanner = 0x1501;
+
     private static readonly Color Accent = Color.FromArgb(21, 101, 192);
     private static readonly Color Surface = Color.FromArgb(243, 247, 252);
     private static readonly Color TextDark = Color.FromArgb(32, 33, 36);
     private static readonly Color TextMuted = Color.FromArgb(104, 107, 112);
+    private static readonly Color Border = Color.FromArgb(200, 203, 207);
 
     private readonly ListView _list = new();
     private readonly TextBox _searchBox = new();
-    private readonly TextBox _manualBox = new();
     private readonly Label _countLabel = new();
+    private readonly Label _emptyLabel = new();
+    private readonly ToolTip _toolTip = new() { ShowAlways = true };
     private readonly List<ProcessEntry> _entries = new();
     private readonly HashSet<string> _selected = new(StringComparer.OrdinalIgnoreCase);
     private bool _suppressCheck;
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
 
     public ProcessSelectorForm(IEnumerable<string>? selectedNames)
     {
@@ -32,7 +40,7 @@ public sealed class ProcessSelectorForm : Form
         }
 
         Text = "选择目标进程";
-        ClientSize = new Size(640, 612);
+        ClientSize = new Size(460, 520);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
@@ -50,130 +58,92 @@ public sealed class ProcessSelectorForm : Form
 
     private void BuildUi()
     {
-        var header = new Panel
-        {
-            Location = new Point(0, 0),
-            Size = new Size(640, 58),
-            BackColor = Accent,
-        };
-        header.Controls.Add(new Label
+        Controls.Add(new Label
         {
             Text = "选择目标进程",
-            Font = new Font("Microsoft YaHei UI", 14F, FontStyle.Bold),
-            ForeColor = Color.White,
-            AutoSize = true,
-            Location = new Point(20, 14),
-        });
-        Controls.Add(header);
-
-        Controls.Add(new Label
-        {
-            Text = "勾选后仅对这些程序生效；不勾选任何程序 = 全局（所有进程）。\r\n" +
-                   "按进程名匹配，同一程序的多开实例都会生效。",
-            Font = new Font("Microsoft YaHei UI", 8.5F),
-            ForeColor = TextMuted,
-            AutoSize = false,
-            Location = new Point(20, 70),
-            Size = new Size(600, 36),
-        });
-
-        Controls.Add(new Label
-        {
-            Text = "搜索",
+            Font = new Font("Microsoft YaHei UI", 11F, FontStyle.Bold),
             ForeColor = TextDark,
             AutoSize = true,
-            Location = new Point(20, 118),
+            Location = new Point(16, 14),
         });
 
-        _searchBox.Location = new Point(76, 112);
-        _searchBox.Size = new Size(544, 27);
+        Controls.Add(new Label
+        {
+            Text = "勾选后仅对这些程序生效；不勾选 = 全局（所有进程）",
+            Font = new Font("Microsoft YaHei UI", 8.5F),
+            ForeColor = TextMuted,
+            AutoSize = true,
+            Location = new Point(16, 42),
+        });
+
+        _searchBox.Location = new Point(16, 68);
+        _searchBox.Size = new Size(372, 28);
         _searchBox.TextChanged += (_, _) => RebuildItems();
         Controls.Add(_searchBox);
 
-        _list.Location = new Point(20, 148);
-        _list.Size = new Size(600, 368);
+        var refreshButton = new Button
+        {
+            Text = "刷新",
+            Location = new Point(396, 68),
+            Size = new Size(48, 28),
+            FlatStyle = FlatStyle.Flat,
+            BackColor = Color.White,
+            ForeColor = Color.FromArgb(60, 64, 67),
+            FlatAppearance = { BorderColor = Border },
+        };
+        refreshButton.Click += (_, _) => ReloadProcesses();
+        Controls.Add(refreshButton);
+
+        _list.Location = new Point(16, 108);
+        _list.Size = new Size(428, 332);
         _list.View = View.Details;
         _list.CheckBoxes = true;
         _list.FullRowSelect = true;
         _list.HeaderStyle = ColumnHeaderStyle.Nonclickable;
         _list.HideSelection = false;
         _list.MultiSelect = true;
-        _list.Columns.Add("进程", 180);
-        _list.Columns.Add("实例", 55);
-        _list.Columns.Add("路径", 320);
+        _list.ShowItemToolTips = false;
+        _list.Columns.Add("进程", 384);
         _list.ItemChecked += List_ItemChecked;
+        _list.ItemMouseHover += List_ItemMouseHover;
+        _list.MouseLeave += (_, _) => _toolTip.Hide(_list);
+        _list.DoubleClick += List_DoubleClick;
         Controls.Add(_list);
 
-        Controls.Add(new Label
-        {
-            Text = "手动添加",
-            ForeColor = TextDark,
-            AutoSize = true,
-            Location = new Point(20, 532),
-        });
-
-        _manualBox.Location = new Point(96, 526);
-        _manualBox.Size = new Size(314, 27);
-        _manualBox.KeyDown += (_, e) =>
-        {
-            if (e.KeyCode != Keys.Enter)
-                return;
-            e.SuppressKeyPress = true;
-            AddManual();
-        };
-        Controls.Add(_manualBox);
-
-        var addButton = new Button
-        {
-            Text = "添加",
-            Location = new Point(418, 525),
-            Size = new Size(64, 30),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = Color.White,
-            FlatAppearance = { BorderColor = Color.FromArgb(200, 203, 207) },
-        };
-        addButton.Click += (_, _) => AddManual();
-        Controls.Add(addButton);
-
-        var browseButton = new Button
-        {
-            Text = "浏览 EXE…",
-            Location = new Point(490, 525),
-            Size = new Size(130, 30),
-            FlatStyle = FlatStyle.Flat,
-            BackColor = Color.White,
-            FlatAppearance = { BorderColor = Color.FromArgb(200, 203, 207) },
-        };
-        browseButton.Click += (_, _) => BrowseExe();
-        Controls.Add(browseButton);
-
-        var refreshButton = CreateDialogButton("刷新", new Point(20, 572), 88);
-        refreshButton.Click += (_, _) => ReloadProcesses();
-        Controls.Add(refreshButton);
-
-        var selectAllButton = CreateDialogButton("全选", new Point(116, 572), 80);
-        selectAllButton.Click += (_, _) => SelectAllVisible();
-        Controls.Add(selectAllButton);
-
-        var clearButton = CreateDialogButton("清除", new Point(204, 572), 80);
-        clearButton.Click += (_, _) => ClearSelection();
-        Controls.Add(clearButton);
+        _emptyLabel.Text = "没有匹配的进程";
+        _emptyLabel.ForeColor = TextMuted;
+        _emptyLabel.BackColor = Color.White;
+        _emptyLabel.TextAlign = ContentAlignment.MiddleCenter;
+        _emptyLabel.AutoSize = false;
+        _emptyLabel.Location = new Point(17, 129);
+        _emptyLabel.Size = new Size(426, 309);
+        _emptyLabel.Visible = false;
+        Controls.Add(_emptyLabel);
+        _emptyLabel.BringToFront();
 
         _countLabel.Text = "当前：全局";
         _countLabel.ForeColor = TextMuted;
         _countLabel.AutoSize = true;
-        _countLabel.Location = new Point(296, 579);
+        _countLabel.Location = new Point(16, 452);
         Controls.Add(_countLabel);
 
-        var cancelButton = CreateDialogButton("取消", new Point(420, 572), 100);
+        var selectAllLink = CreateLinkLabel("全选", new Point(326, 451));
+        selectAllLink.Click += (_, _) => SelectAllVisible();
+        Controls.Add(selectAllLink);
+
+        var clearLink = CreateLinkLabel("清除", new Point(376, 451));
+        clearLink.Click += (_, _) => ClearSelection();
+        Controls.Add(clearLink);
+
+        var cancelButton = CreateDialogButton("取消", new Point(252, 478), 92);
         cancelButton.DialogResult = DialogResult.Cancel;
         Controls.Add(cancelButton);
 
         var okButton = new Button
         {
             Text = "确定",
-            Location = new Point(528, 572),
-            Size = new Size(92, 30),
+            Location = new Point(352, 478),
+            Size = new Size(92, 32),
             FlatStyle = FlatStyle.Flat,
             BackColor = Accent,
             ForeColor = Color.White,
@@ -198,15 +168,41 @@ public sealed class ProcessSelectorForm : Form
         CancelButton = cancelButton;
     }
 
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+            _toolTip.Dispose();
+        base.Dispose(disposing);
+    }
+
+    protected override void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        SendMessage(_searchBox.Handle, EmSetCueBanner, (IntPtr)1, "搜索进程名…");
+        _searchBox.Focus();
+    }
+
+    private static LinkLabel CreateLinkLabel(string text, Point location) => new()
+    {
+        Text = text,
+        AutoSize = true,
+        Location = location,
+        Font = new Font("Microsoft YaHei UI", 8.5F),
+        LinkColor = Accent,
+        ActiveLinkColor = Accent,
+        VisitedLinkColor = Accent,
+        LinkBehavior = LinkBehavior.HoverUnderline,
+    };
+
     private static Button CreateDialogButton(string text, Point location, int width) => new()
     {
         Text = text,
         Location = location,
-        Size = new Size(width, 30),
+        Size = new Size(width, 32),
         FlatStyle = FlatStyle.Flat,
         BackColor = Color.White,
         ForeColor = Color.FromArgb(60, 64, 67),
-        FlatAppearance = { BorderColor = Color.FromArgb(200, 203, 207) },
+        FlatAppearance = { BorderColor = Border },
     };
 
     private void ReloadProcesses()
@@ -285,15 +281,14 @@ public sealed class ProcessSelectorForm : Form
                          .ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase))
             {
                 if (filter.Length > 0 &&
-                    entry.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0 &&
-                    entry.Path.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
+                    entry.Name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0)
                 {
                     continue;
                 }
 
                 var item = new ListViewItem(entry.Name) { Tag = entry };
-                item.SubItems.Add(entry.Count == 0 ? "未运行" : entry.Count.ToString());
-                item.SubItems.Add(entry.Path);
+                if (entry.Count == 0)
+                    item.ForeColor = TextMuted;
                 _list.Items.Add(item);
                 item.Checked = _selected.Contains(entry.Name);
             }
@@ -304,6 +299,7 @@ public sealed class ProcessSelectorForm : Form
             _suppressCheck = false;
         }
 
+        _emptyLabel.Visible = _list.Items.Count == 0;
         UpdateCount();
     }
 
@@ -320,52 +316,34 @@ public sealed class ProcessSelectorForm : Form
         UpdateCount();
     }
 
+    private void List_ItemMouseHover(object? sender, ListViewItemMouseHoverEventArgs e)
+    {
+        if (e.Item?.Tag is not ProcessEntry entry)
+        {
+            _toolTip.Hide(_list);
+            return;
+        }
+
+        var tip = entry.Count == 0
+            ? "当前未运行（按进程名匹配，启动后生效）"
+            : $"实例：{entry.Count}";
+        if (entry.Path.Length > 0)
+            tip += $"\n{entry.Path}";
+
+        _toolTip.Show(tip, _list, e.Item.Position.X + 24, e.Item.Position.Y + 22, 8000);
+    }
+
+    private void List_DoubleClick(object? sender, EventArgs e)
+    {
+        if (_list.FocusedItem is { } item)
+            item.Checked = !item.Checked;
+    }
+
     private void UpdateCount()
     {
         _countLabel.Text = _selected.Count == 0
             ? "当前：全局"
             : $"已选 {_selected.Count} 个";
-    }
-
-    private void AddManual()
-    {
-        var display = ProcessFlowFilter.NormalizeDisplayName(_manualBox.Text);
-        if (display.Length == 0)
-        {
-            MessageBox.Show(this, "请输入进程名，例如 chrome.exe。", "选择目标进程",
-                MessageBoxButtons.OK, MessageBoxIcon.Information);
-            return;
-        }
-
-        _selected.Add(display);
-        if (_entries.All(e => !string.Equals(e.Name, display, StringComparison.OrdinalIgnoreCase)))
-            _entries.Add(new ProcessEntry { Name = display, Count = 0 });
-
-        _manualBox.Clear();
-        RebuildItems();
-    }
-
-    private void BrowseExe()
-    {
-        using var dialog = new OpenFileDialog
-        {
-            Title = "选择程序",
-            Filter = "程序 (*.exe)|*.exe|所有文件 (*.*)|*.*",
-            CheckFileExists = true,
-        };
-
-        if (dialog.ShowDialog(this) != DialogResult.OK)
-            return;
-
-        var display = ProcessFlowFilter.NormalizeDisplayName(dialog.FileName);
-        if (display.Length == 0)
-            return;
-
-        _selected.Add(display);
-        if (_entries.All(e => !string.Equals(e.Name, display, StringComparison.OrdinalIgnoreCase)))
-            _entries.Add(new ProcessEntry { Name = display, Count = 0 });
-
-        RebuildItems();
     }
 
     private void SelectAllVisible()

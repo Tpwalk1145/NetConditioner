@@ -1,5 +1,4 @@
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using NetConditioner.Models;
 
 namespace NetConditioner.Services;
@@ -7,13 +6,6 @@ namespace NetConditioner.Services;
 /// <summary>负责配置文件的读取、校验和原子写入。</summary>
 public sealed class ProfileStore
 {
-    private static readonly JsonSerializerOptions JsonOptions = new()
-    {
-        WriteIndented = true,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        Converters = { new JsonStringEnumConverter() },
-    };
-
     public ProfileStore(string? path = null)
     {
         ConfigPath = path ?? Path.Combine(
@@ -39,7 +31,7 @@ public sealed class ProfileStore
         try
         {
             var json = File.ReadAllText(ConfigPath);
-            var config = JsonSerializer.Deserialize<AppConfig>(json, JsonOptions)
+            var config = JsonSerializer.Deserialize(json, ConfigJsonContext.Default.AppConfig)
                          ?? throw new JsonException("配置文件内容为空。");
 
             Sanitize(config, ref warning);
@@ -63,7 +55,7 @@ public sealed class ProfileStore
         Directory.CreateDirectory(dir);
 
         var tempPath = ConfigPath + ".tmp";
-        var json = JsonSerializer.Serialize(config, JsonOptions);
+        var json = JsonSerializer.Serialize(config, ConfigJsonContext.Default.AppConfig);
         File.WriteAllText(tempPath, json);
         File.Move(tempPath, ConfigPath, overwrite: true);
     }

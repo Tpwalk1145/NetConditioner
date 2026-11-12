@@ -156,7 +156,8 @@ public sealed class MainForm : Form
         _profileCombo.Location = new Point(20, 240);
         _profileCombo.Size = new Size(322, 28);
         _profileCombo.DropDownStyle = ComboBoxStyle.DropDownList;
-        _profileCombo.DisplayMember = nameof(NetworkProfile.Name);
+        // 不设置 DisplayMember：NativeAOT/裁剪后 WinForms 的数据绑定反射路径不可用，
+        // NetworkProfile 已重写 ToString()，ComboBox 会直接显示配置名。
         _profileCombo.SelectedIndexChanged += ProfileCombo_SelectedIndexChanged;
         Controls.Add(_profileCombo);
 

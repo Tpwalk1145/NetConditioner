@@ -13,7 +13,7 @@ Windows 系统级弱网模拟工具：通过全局热键一键开启/停止上�
 - 弱网协议：`TCP`、`UDP`、`ALL`（TCP + UDP）
 - 目标进程过滤（全局设置）：主窗口“启动弱网”上方可选择程序，只对它们生效；**不选任何进程 = 全局**
   - 按进程名匹配（如 `chrome.exe`），同一程序的多开实例都会生效
-  - 支持搜索、手动输入进程名、直接浏览 EXE
+  - 支持按进程名搜索；勾选即生效
 - 多套配置：新建、编辑、删除、快速切换
 - 小窗口 + 系统托盘 + 自定义全局热键（默认 `Ctrl + Alt + U`；也支持单键，如 `F8`）
   - 单键会全局占用该按键，例如把字母 `A` 设为热键后，正常打字也会触发；建议优先用 F1–F12 等不常用键。
@@ -36,35 +36,109 @@ Windows 系统级弱网模拟工具：通过全局热键一键开启/停止上�
 
 - Windows 10 / 11 x64
 - 管理员权限（WinDivert 驱动需要）
-- .NET 11 Desktop Runtime（本机 SDK 已包含）
+- 运行程序：**不需要 .NET 运行时**（程序以 NativeAOT 编译成原生单文件 exe）
+- 构建程序：需要 .NET 11 SDK；打包安装包另需 Inno Setup 6
 - 随程序附带的 `WinDivert.dll` / `WinDivert64.sys`（2.2.2 官方版本）
 
 ## 构建与运行
+
+一键构建（编译 + 发布 + 打包安装包）：
+
+```powershell
+cd NetConditioner
+.\build.ps1
+```
+
+也可以直接双击根目录的 `build.cmd`（等价于执行 `build.ps1`）。
+
+只编译、不打包：
+
+```powershell
+.\build.ps1 -SkipInstaller
+```
+
+或者手动执行：
 
 ```powershell
 cd NetConditioner
 dotnet build -c Release
 ```
 
-运行（发布目录）：
+发布 NativeAOT 单文件（原生 exe，无需 .NET 运行时）：
 
-```text
-NetConditioner\publish\NetConditioner.exe
+```powershell
+dotnet publish -c Release -r win-x64 -p:PublishProfile=Aot -o publish\win-x64-selfcontained
 ```
 
-也可以直接使用 `bin\Release\net11.0-windows\NetConditioner.exe`。
+运行（AOT 发布目录）：
 
-首次运行会弹出 UAC；程序需要以管理员身份运行。请保持以下文件与 exe 在同一目录：
+```text
+NetConditioner\publish\win-x64-selfcontained\NetConditioner.exe
+```
+
+运行只需要下面这三个文件（约 21 MB；发布目录里的 `third_party` 仅为 WinDivert 许可文件）：
 
 ```text
 NetConditioner.exe
-NetConditioner.dll
-NetConditioner.runtimeconfig.json
 WinDivert.dll
 WinDivert64.sys
 ```
 
-`WinDivert.dll` 会自动加载同目录的 `WinDivert64.sys`。
+`bin\Release\net11.0-windows\NetConditioner.exe` 是普通托管构建，仅供本机调试，运行时需要 .NET 11 Desktop Runtime。
+
+首次运行会弹出 UAC；程序需要以管理员身份运行。`WinDivert.dll` 会自动加载同目录的 `WinDivert64.sys`。
+
+## 打包安装包
+
+使用 [Inno Setup 6](https://jrsoftware.org/isinfo.php) 制作安装包。程序以 NativeAOT 编译成单文件原生 exe，目标机器**无需安装 .NET 运行时**。
+
+1. 安装 Inno Setup 6：
+
+   ```powershell
+   winget install JRSoftware.InnoSetup
+   ```
+
+2. 在仓库根目录执行一键构建脚本（编译 → 发布 → 打包）：
+
+   ```powershell
+   .\build.ps1
+   ```
+
+   也可以直接双击根目录的 `build.cmd`。脚本会先编译 Release，再以 `win-x64`、NativeAOT 单文件方式发布程序，最后调用 `ISCC.exe` 生成：
+
+   ```text
+   dist\NetConditioner-1.0.0-win-x64-Setup.exe
+   ```
+
+3. 双击安装包安装；会创建开始菜单快捷方式和卸载项，默认安装到 `C:\Program Files\NetConditioner`。程序仍按 `app.manifest` 请求管理员权限。
+
+`build.ps1` 常用参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `-Version 1.0.1` | 指定安装包版本（默认取 csproj 里的 `Version`） |
+| `-Clean` | 先删除 `bin` / `obj` / `publish` / `dist` 再构建 |
+| `-SkipInstaller` | 只编译，不发布、不打包 |
+| `-SkipPublish` | 复用现有 `publish` 目录，只重新生成安装包 |
+| `-Configuration Debug` | 指定构建配置（默认 `Release`） |
+| `-ISCCPath <路径>` | 手动指定 `ISCC.exe` |
+
+说明：
+
+- 安装包约 7 MB：NativeAOT 单文件约 21 MB，再经 LZMA2 压缩（旧的自包含发布约 38 MB）。
+- `ISCC.exe` 不在 PATH 时，可用 `-ISCCPath` 指定，或设置 `INNO_SETUP_HOME` 环境变量；未安装 Inno Setup 时脚本会直接报错提示。
+- 根目录 `build.ps1` 是入口，实际的发布 + ISCC 编译逻辑在 `installer\build-installer.ps1`，也可以单独调用它。
+- 配置仍保存在 `%AppData%\NetConditioner\config.json`，卸载不会删除。
+
+### NativeAOT 说明
+
+- 发布配置在 `Properties/PublishProfiles/Aot.pubxml`，用 `dotnet publish -p:PublishProfile=Aot` 调用。
+- **不要**在 `NetConditioner.csproj` 里全局设置 `PublishAot`：那会让 `dotnet build` 因 Windows 窗体 + 剪裁检查（NETSDK1175）直接失败。
+- 为 AOT 做的适配：
+  - `config.json` 改用 System.Text.Json 源生成（`Models/ConfigJsonContext.cs`），不再依赖反射序列化；旧配置文件可以直接读取，输出格式不变；
+  - 配置下拉框不再使用 `DisplayMember` 数据绑定（裁剪后 WinForms 会抛 `NotSupportedException`），改为依赖 `NetworkProfile.ToString()`。
+- Windows 窗体官方未正式支持 NativeAOT，发布时会出现 `IL3053` / `IL3000` 分析警告（来自 WinForms 程序集自身），属已知情况。当前产物已通过 `NetConditioner.exe --self-test` 全项自测，并冒烟验证了主窗口、配置编辑、设置、进程选择、托盘隐藏/退出；启动约 0.2 秒。
+- 升级 .NET SDK 后请重新跑自测并冒烟上述窗口。
 
 ## 使用
 
@@ -168,7 +242,7 @@ WinDivert64.sys
 NetConditioner.exe --self-test
 ```
 
-覆盖上下行延时、64kbps 限速、100% 丢包、停止恢复、进程过滤（IPv4/IPv6 TCP、UDP；命中生效 / 未命中直通）、64KB/1MB 突发无额外丢包，以及真实网卡 80 端口的上下行方向验证。结果写入 `%TEMP%\NetConditioner-selftest.log`。自测只影响本机回环测试端口和公网 80 端口，不会影响 443 连接。
+覆盖上下行延时、64kbps 限速、100% 丢包、停止恢复、进程过滤（IPv4/IPv6 TCP、UDP；命中生效 / 未命中直通）、64KB/1MB 突发无额外丢包，以及真实网卡 80 端口的上下行方向验证。结果写入 `%TEMP%\NetConditioner-selftest.log`。自测只影响本机回环测试端口和公网 80 端口，不会影响 443 连接。NativeAOT 发布版同样支持 `--self-test`。
 
 ## 与 TUN/TAP、VPN 的关系
 
@@ -180,10 +254,13 @@ NetConditioner.exe --self-test
 NetConditioner/
   NetConditioner.csproj
   app.manifest                 # requireAdministrator
+  build.ps1 / build.cmd        # 一键构建（编译 + AOT 发布 + 打包安装包）
   Program.cs                   # 入口、单实例、--self-test
-  Models/                      # 配置模型
+  Models/                      # 配置模型、System.Text.Json 源生成上下文
   Services/                    # WinDivert、弱网引擎、进程过滤、配置存储、热键
   Forms/                       # 主窗口、配置编辑、设置、进程选择
+  Properties/PublishProfiles/  # NativeAOT 发布配置（Aot.pubxml）
+  installer/                   # Inno Setup 脚本、中文语言文件、打包脚本
   third_party/WinDivert/       # WinDivert 2.2.2 DLL/SYS、LICENSE、VERSION
   README.md
 ```
