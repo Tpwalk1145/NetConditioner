@@ -68,6 +68,13 @@ public sealed class ProfileStore
         config.Settings.MaxRunMinutes = Math.Clamp(config.Settings.MaxRunMinutes, 0, 1440);
         config.Settings.MaxQueueDelayMs = Math.Clamp(config.Settings.MaxQueueDelayMs, 0, 60000);
         config.Settings.ProcessNames = SanitizeProcessNames(config.Settings.ProcessNames);
+        config.Settings.UpdateFeedUrl = SanitizeFeedUrl(config.Settings.UpdateFeedUrl);
+
+        var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        config.Settings.LastUpdateCheckUnix = ClampUnix(config.Settings.LastUpdateCheckUnix, now);
+        config.Settings.LastUpdateAttemptUnix = ClampUnix(config.Settings.LastUpdateAttemptUnix, now);
+        config.Settings.LastAttemptedVersion =
+            AppVersion.Normalize(config.Settings.LastAttemptedVersion) ?? string.Empty;
 
         // 去掉明显损坏的配置项，并修正重复 Id。
         var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -98,6 +105,25 @@ public sealed class ProfileStore
 
         if (removed > 0)
             warning = $"已忽略 {removed} 个损坏的配置项。";
+    }
+
+    private static string SanitizeFeedUrl(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return string.Empty;
+
+        var text = raw.Trim();
+        if (text.Length > 2048)
+            return string.Empty;
+
+        return UpdateService.TryValidateFeedUrl(text, out _) ? text : string.Empty;
+    }
+
+    private static long ClampUnix(long value, long now)
+    {
+        if (value < 0)
+            return 0;
+        return value > now + 86400 ? now : value;
     }
 
     private static List<string> SanitizeProcessNames(List<string>? names)

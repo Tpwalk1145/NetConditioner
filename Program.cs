@@ -17,6 +17,12 @@ internal static class Program
             return;
         }
 
+        if (args.Any(a => a.Equals("--check-update", StringComparison.OrdinalIgnoreCase)))
+        {
+            Environment.ExitCode = UpdateService.RunCheckCommand();
+            return;
+        }
+
         _instanceMutex = new Mutex(true, @"Global\NetConditioner.SingleInstance", out var createdNew);
         if (!createdNew)
         {

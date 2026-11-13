@@ -18,6 +18,7 @@ Windows 系统级弱网模拟工具：通过全局热键一键开启/停止上�
 - 小窗口 + 系统托盘 + 自定义全局热键（默认 `Ctrl + Alt + U`；也支持单键，如 `F8`）
   - 单键会全局占用该按键，例如把字母 `A` 设为热键后，正常打字也会触发；建议优先用 F1–F12 等不常用键。
 - 实时统计：上下行发送、丢弃、队列长度
+- 云更新：配置更新地址后，后台静默检查新版本并自动升级（不弹窗，升级时窗口闪一下重启）
 - 最长运行时间保护：到时自动停止并恢复网络
 - 最大额外排队时延保护：避免突发流量把队列堆到几分钟，造成严重卡顿
 - 配置与目标进程设置保存在 `%AppData%\NetConditioner\config.json`
@@ -116,7 +117,9 @@ WinDivert64.sys
 
 | 参数 | 说明 |
 | --- | --- |
-| `-Version 1.0.1` | 指定安装包版本（默认取 csproj 里的 `Version`） |
+| `-Version 1.1.0` | 指定安装包版本（默认取 csproj 里的 `Version`） |
+| `-UpdateBaseUrl <url>` | 云更新地址前缀；生成 `dist\latest.json` 时用作安装包 URL（默认占位地址，上传前需替换） |
+| `-Notes <文本>` | 写进 `latest.json` 的更新说明 |
 | `-Clean` | 先删除 `bin` / `obj` / `publish` / `dist` 再构建 |
 | `-SkipInstaller` | 只编译，不发布、不打包 |
 | `-SkipPublish` | 复用现有 `publish` 目录，只重新生成安装包 |
@@ -128,6 +131,7 @@ WinDivert64.sys
 - 安装包约 7 MB：NativeAOT 单文件约 21 MB，再经 LZMA2 压缩（旧的自包含发布约 38 MB）。
 - `ISCC.exe` 不在 PATH 时，可用 `-ISCCPath` 指定，或设置 `INNO_SETUP_HOME` 环境变量；未安装 Inno Setup 时脚本会直接报错提示。
 - 根目录 `build.ps1` 是入口，实际的发布 + ISCC 编译逻辑在 `installer\build-installer.ps1`，也可以单独调用它。
+- 构建完成后会同时生成 `dist\latest.json`（云更新清单），把它和安装包一起上传即可。
 - 配置仍保存在 `%AppData%\NetConditioner\config.json`，卸载不会删除。
 
 ### NativeAOT 说明
@@ -139,6 +143,68 @@ WinDivert64.sys
   - 配置下拉框不再使用 `DisplayMember` 数据绑定（裁剪后 WinForms 会抛 `NotSupportedException`），改为依赖 `NetworkProfile.ToString()`。
 - Windows 窗体官方未正式支持 NativeAOT，发布时会出现 `IL3053` / `IL3000` 分析警告（来自 WinForms 程序集自身），属已知情况。当前产物已通过 `NetConditioner.exe --self-test` 全项自测，并冒烟验证了主窗口、配置编辑、设置、进程选择、托盘隐藏/退出；启动约 0.2 秒。
 - 升级 .NET SDK 后请重新跑自测并冒烟上述窗口。
+
+## 云更新（静默自动升级）
+
+配置更新地址后，程序会在后台**完全静默**地检查、下载、校验并安装新版本：没有弹窗、没有托盘气泡、没有安装向导，唯一可见的现象是升级时窗口闪一下后重新出现。
+
+### 行为
+
+- 启动约 5 秒后检查一次，之后每 6 小时检查一次；**每天最多检查一次**（距上次检查不足 24 小时则跳过）。
+- 发现新版本后自动下载到 `%TEMP%\NetConditioner\update\`，边下边算 SHA256；校验失败会删除文件，并在 24 小时内不再尝试同一版本。
+- 只有“空闲”时才安装：弱网未运行、没有正在切换、没有打开设置/编辑等对话框。弱网运行中只等待，不打断；停止弱网或隐藏到托盘后会继续静默安装。
+- 安装时用 `/VERYSILENT` 静默运行安装包，安装完成后自动重新启动程序。
+- 所有失败只写入 `%TEMP%\NetConditioner\update\update.log`，不打扰用户。
+
+### 配置
+
+打开“设置 → 软件更新”：
+
+| 项 | 说明 |
+| --- | --- |
+| 更新地址（latest.json） | 例如 `https://你的域名/NetConditioner/latest.json`；留空 = 关闭云更新（默认） |
+| 自动静默更新 | 默认开启；关闭后不会检查更新 |
+
+仅支持 https；本机回环地址（`http://127.0.0.1:...`）允许 http，便于本地联调。
+
+### 生成更新清单
+
+```powershell
+.\build.ps1 -UpdateBaseUrl https://你的域名/NetConditioner -Notes "修复若干问题"
+```
+
+会在 `dist\` 生成 `latest.json`，内容形如：
+
+```json
+{
+  "schemaVersion": 1,
+  "version": "1.1.0",
+  "publishedAt": "2026-11-13T00:00:00Z",
+  "notes": "修复若干问题",
+  "pageUrl": "https://你的域名/NetConditioner/",
+  "installer": {
+    "url": "https://你的域名/NetConditioner/NetConditioner-1.1.0-win-x64-Setup.exe",
+    "sha256": "D9C7F19E...",
+    "size": 7123456
+  }
+}
+```
+
+把 `latest.json` 和对应的安装包上传到同一目录即可。任意静态托管（对象存储、Nginx、GitHub Releases）都可以；用 GitHub Releases 时可以用固定地址 `https://github.com/<用户>/<仓库>/releases/latest/download/latest.json`，把 `latest.json` 作为 release 资产上传。
+
+### 诊断
+
+```powershell
+# 按当前配置检查一次，结果写到 %TEMP%\NetConditioner-update-check.log（不弹任何界面）
+NetConditioner.exe --check-update
+
+# 开发者联调：只记录安装命令，不真正运行安装包
+$env:NC_UPDATE_DRY_RUN = "1"
+```
+
+### 安全边界
+
+自动更新没有用户确认环节，因此依赖：**https 传输 + latest.json 中的 SHA256 完整性校验 + 更新源可信**。请只把更新地址指向自己控制的服务器；项目未做代码签名。
 
 ## 使用
 
@@ -231,10 +297,12 @@ WinDivert64.sys
 | 启动失败，错误 2 | `WinDivert.dll` / `WinDivert64.sys` 不在 exe 同目录 |
 | 启动失败，错误 5 | 没有以管理员身份运行 |
 | 启动失败，错误 577 / 1275 | 驱动签名被拦截或安全软件阻止；检查杀毒软件，使用随包的 2.2.2 官方文件 |
-| 提示已有不兼容的 WinDivert 驱动 | 本机其它程序（如 Steam++/Watt Toolkit、某些代理工具）可能加载了不同版本的 WinDivert；退出该程序或重启后再试 |
+| 提示已有不兼容的 WinDivert 驱动 | 本机其它程序可能加载了不同版本的 WinDivert；退出该程序或重启后再试 |
 | 热键没反应 | 热键被其它程序占用，打开“设置”换一个组合 |
 | 选了目标进程但没效果 | 确认进程名与任务管理器一致；新启动的程序最多约 2 秒后生效；系统驱动级流量可能没有 TCP/UDP 记录 |
 | 启动后立即恢复 | 检查 Windows 事件查看器/杀毒软件；可运行 `NetConditioner.exe --self-test` 查看日志 |
+| 云更新没生效 | 看 `%TEMP%\NetConditioner\update\update.log`；确认“设置 → 软件更新”里已填 https 地址并勾选自动静默更新 |
+| 更新后程序没重新打开 | 手工启动程序；安装日志在 `%TEMP%\NetConditioner\update\install-*.log` |
 
 自测：
 
@@ -242,7 +310,7 @@ WinDivert64.sys
 NetConditioner.exe --self-test
 ```
 
-覆盖上下行延时、64kbps 限速、100% 丢包、停止恢复、进程过滤（IPv4/IPv6 TCP、UDP；命中生效 / 未命中直通）、64KB/1MB 突发无额外丢包，以及真实网卡 80 端口的上下行方向验证。结果写入 `%TEMP%\NetConditioner-selftest.log`。自测只影响本机回环测试端口和公网 80 端口，不会影响 443 连接。NativeAOT 发布版同样支持 `--self-test`。
+覆盖上下行延时、64kbps 限速、100% 丢包、停止恢复、进程过滤（IPv4/IPv6 TCP、UDP；命中生效 / 未命中直通）、64KB/1MB 突发无额外丢包、真实网卡 80 端口的上下行方向验证，以及云更新（版本比较、latest.json 校验、配置清洗、本地回环 HTTP 下载与 SHA256 校验/篡改拒绝）。结果写入 `%TEMP%\NetConditioner-selftest.log`。自测只影响本机回环测试端口和公网 80 端口，不会影响 443 连接。NativeAOT 发布版同样支持 `--self-test`。
 
 ## 与 TUN/TAP、VPN 的关系
 
@@ -255,9 +323,9 @@ NetConditioner/
   NetConditioner.csproj
   app.manifest                 # requireAdministrator
   build.ps1 / build.cmd        # 一键构建（编译 + AOT 发布 + 打包安装包）
-  Program.cs                   # 入口、单实例、--self-test
-  Models/                      # 配置模型、System.Text.Json 源生成上下文
-  Services/                    # WinDivert、弱网引擎、进程过滤、配置存储、热键
+  Program.cs                   # 入口、单实例、--self-test、--check-update
+  Models/                      # 配置模型、更新清单模型、System.Text.Json 源生成上下文
+  Services/                    # WinDivert、弱网引擎、进程过滤、配置存储、热键、云更新
   Forms/                       # 主窗口、配置编辑、设置、进程选择
   Properties/PublishProfiles/  # NativeAOT 发布配置（Aot.pubxml）
   installer/                   # Inno Setup 脚本、中文语言文件、打包脚本

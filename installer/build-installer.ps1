@@ -25,6 +25,8 @@ param(
     [string]$Runtime = 'win-x64',
     [string]$Version,
     [string]$ISCCPath,
+    [string]$UpdateBaseUrl,
+    [string]$Notes,
     [switch]$SkipPublish
 )
 
@@ -102,7 +104,8 @@ if (-not $SkipPublish) {
     }
     # PublishProfile=Aot 打开 PublishAot + StripSymbols；不能写进 csproj，
     # 否则 dotnet build 会因 Windows 窗体 + 剪裁检查（NETSDK1175）而失败。
-    & dotnet publish $projectPath -c $Configuration -r $Runtime -p:PublishProfile=Aot -p:DebugType=None -p:DebugSymbols=false -o $payloadDir
+    # --disable-build-servers：避免 SDK 等待 MSBuild 服务器连接超时（约 8 秒）并打印警告。
+    & dotnet publish $projectPath -c $Configuration -r $Runtime -p:PublishProfile=Aot -p:DebugType=None -p:DebugSymbols=false -o $payloadDir --disable-build-servers
     if ($LASTEXITCODE -ne 0) {
         throw "dotnet publish failed with exit code $LASTEXITCODE"
     }
@@ -143,6 +146,7 @@ if (-not (Test-Path -LiteralPath $setupPath)) {
     throw "Installer output was not found: $setupPath"
 }
 
+
 $setup = Get-Item -LiteralPath $setupPath
 $hash = Get-FileHash -LiteralPath $setupPath -Algorithm SHA256
 Write-Host ''
@@ -150,3 +154,36 @@ Write-Host 'Installer built successfully:'
 Write-Host "  Path   : $($setup.FullName)"
 Write-Host "  Size   : $([math]::Round($setup.Length / 1MB, 2)) MB"
 Write-Host "  SHA256 : $($hash.Hash)"
+
+if (-not $UpdateBaseUrl) {
+    $UpdateBaseUrl = 'https://example.com/NetConditioner'
+    Write-Host ''
+    Write-Warning '未提供 -UpdateBaseUrl：latest.json 使用占位地址，上传前请改成真实地址。'
+}
+$baseUrl = $UpdateBaseUrl.TrimEnd('/')
+if (-not $Notes) { $Notes = "版本 $Version" }
+
+$manifest = [ordered]@{
+    schemaVersion = 1
+    version       = $Version
+    publishedAt   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    notes         = $Notes
+    pageUrl       = "$baseUrl/"
+    installer     = [ordered]@{
+        url    = "$baseUrl/$($setup.Name)"
+        sha256 = $hash.Hash
+        size   = $setup.Length
+    }
+}
+
+$manifestPath = Join-Path $distDir 'latest.json'
+$manifestJson = ($manifest | ConvertTo-Json -Depth 5) + [Environment]::NewLine
+[System.IO.File]::WriteAllText(
+    $manifestPath, $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
+
+Write-Host ''
+Write-Host 'Update manifest generated:'
+Write-Host "  Path   : $manifestPath"
+Write-Host "  URL    : $baseUrl/$($setup.Name)"
+Write-Host "  SHA256 : $($hash.Hash)"
+Write-Host '  上传时把 Setup exe 和 latest.json 放在同一目录。'

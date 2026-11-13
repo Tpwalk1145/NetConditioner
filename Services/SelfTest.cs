@@ -109,6 +109,194 @@ public static class SelfTest
                 }
             }
 
+            // 云更新：版本号解析与比较。
+            var knownSha = UpdateService.ComputeSha256Hex(Encoding.UTF8.GetBytes("abc"));
+            if (AppVersion.TryParse("1.0.1", out var newerVersion) &&
+                AppVersion.TryParse("1.0.0", out var olderVersion) &&
+                AppVersion.IsNewer(olderVersion, newerVersion) &&
+                !AppVersion.IsNewer(newerVersion, olderVersion) &&
+                !AppVersion.IsNewer(newerVersion, newerVersion) &&
+                AppVersion.TryParse("1.0", out _) &&
+                AppVersion.TryParse("1.0.0.5", out _) &&
+                !AppVersion.TryParse("1.0.0-beta", out _) &&
+                !AppVersion.TryParse("1", out _) &&
+                knownSha == "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD")
+            {
+                Pass("云更新：版本号解析/比较/SHA256 计算正确");
+            }
+            else
+            {
+                Fail("云更新：版本号解析、比较或 SHA256 计算异常。");
+            }
+
+            // 云更新：latest.json 校验规则。
+            var sampleSha = new string('a', 64);
+            var validManifest =
+                "{\"schemaVersion\":1,\"version\":\"9.9.9\",\"notes\":\"test\",\"installer\":{" +
+                "\"url\":\"https://example.com/NetConditioner-9.9.9-win-x64-Setup.exe\"," +
+                "\"sha256\":\"" + sampleSha + "\",\"size\":123}}";
+            var manifestParsed = UpdateService.TryParseManifest(
+                validManifest, out var parsedManifest, out var parsedVersion, out var manifestError);
+            var invalidManifests = new[]
+            {
+                "{\"schemaVersion\":1,\"installer\":{\"url\":\"https://example.com/a.exe\",\"sha256\":\"" + sampleSha + "\"}}",
+                "{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{\"url\":\"https://example.com/a.exe\",\"sha256\":\"abc\"}}",
+                "{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{\"url\":\"http://example.com/a.exe\",\"sha256\":\"" + sampleSha + "\"}}",
+                "{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{\"url\":\"https://example.com/a.exe\",\"sha256\":\"" + sampleSha + "\"}}",
+                "not json",
+            };
+            var invalidRejected = true;
+            foreach (var invalidManifest in invalidManifests)
+            {
+                if (UpdateService.TryParseManifest(invalidManifest, out _, out _, out _))
+                    invalidRejected = false;
+            }
+
+            if (manifestParsed &&
+                parsedManifest.Installer?.Sha256 == sampleSha.ToUpperInvariant() &&
+                parsedVersion.Major == 9 && parsedVersion.Minor == 9 &&
+                invalidRejected)
+            {
+                Pass("云更新：latest.json 校验规则正确（无效内容全部拒绝）");
+            }
+            else
+            {
+                Fail($"云更新：latest.json 校验异常（{manifestError}）。");
+            }
+
+            // 云更新：配置字段默认值与清洗。
+            var updateConfigPath = Path.Combine(
+                Path.GetTempPath(), "NetConditioner-selftest-update.json");
+            try
+            {
+                var updateStore = new ProfileStore(updateConfigPath);
+                var updateConfig = new AppConfig();
+                updateConfig.EnsureDefaultProfile();
+                updateConfig.Settings.UpdateFeedUrl = "http://example.com/latest.json";
+                updateConfig.Settings.LastUpdateCheckUnix = long.MaxValue / 2;
+                updateConfig.Settings.LastAttemptedVersion = "1.2.3";
+                updateStore.Save(updateConfig);
+
+                var reloaded = updateStore.Load(out _);
+                var nowUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                if (reloaded.Settings.UpdateFeedUrl.Length == 0 &&
+                    reloaded.Settings.LastUpdateCheckUnix <= nowUnix + 86400 &&
+                    reloaded.Settings.LastAttemptedVersion == "1.2.3" &&
+                    reloaded.Settings.AutoUpdate)
+                {
+                    Pass("云更新：配置读写与清洗正确");
+                }
+                else
+                {
+                    Fail("云更新：配置读写或清洗异常。");
+                }
+
+                reloaded.Settings.UpdateFeedUrl = "https://example.com/latest.json";
+                updateStore.Save(reloaded);
+                var reloadedAgain = updateStore.Load(out _);
+                if (reloadedAgain.Settings.UpdateFeedUrl == "https://example.com/latest.json")
+                    Pass("云更新：https 更新地址可正常保存");
+                else
+                    Fail("云更新：https 更新地址未被保留。");
+            }
+            catch (Exception ex)
+            {
+                Fail("云更新：配置读写测试异常：" + ex.Message);
+            }
+            finally
+            {
+                try
+                {
+                    File.Delete(updateConfigPath);
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            // 云更新：本地回环 HTTP 服务验证检查、下载与 SHA256 校验。
+            var updatePayload = new byte[64 * 1024];
+            Random.Shared.NextBytes(updatePayload);
+            var updatePayloadSha = UpdateService.ComputeSha256Hex(updatePayload);
+            var updateApiPort = FindFreeTcpPort();
+            MiniHttpServer? updateServer = null;
+            try
+            {
+                updateServer = new MiniHttpServer(updateApiPort);
+                updateServer.SetResponse("/latest.json", () => Encoding.UTF8.GetBytes(
+                    "{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{" +
+                    "\"url\":\"http://127.0.0.1:" + updateApiPort + "/payload.bin\"," +
+                    "\"sha256\":\"" + updatePayloadSha + "\",\"size\":" + updatePayload.Length + "}}"));
+                updateServer.SetResponse("/payload.bin", () => updatePayload);
+                updateServer.Start();
+            }
+            catch (Exception ex)
+            {
+                Write("SKIP  云更新：本地回环测试服务无法启动（" + ex.Message + "）。");
+            }
+
+            if (updateServer is not null)
+            {
+                using (updateServer)
+                {
+                    try
+                    {
+                        var updateService = new UpdateService();
+                        var check = updateService.CheckAsync(
+                                $"http://127.0.0.1:{updateApiPort}/latest.json",
+                                AppVersion.Current, CancellationToken.None)
+                            .GetAwaiter().GetResult();
+
+                        if (check.Status == UpdateCheckStatus.UpdateAvailable &&
+                            check.Manifest?.Installer?.Sha256 == updatePayloadSha)
+                        {
+                            Pass("云更新：本地回环清单解析与版本判断正确");
+                        }
+                        else
+                        {
+                            Fail($"云更新：本地回环检查异常（{check.Status}：{check.Error}）。");
+                        }
+
+                        var updateDest = Path.Combine(
+                            Path.GetTempPath(), "NetConditioner-selftest-update-setup.exe");
+                        var downloaded = updateService.DownloadAsync(
+                                check.Manifest!, updateDest, CancellationToken.None)
+                            .GetAwaiter().GetResult();
+                        var downloadedSha = File.Exists(updateDest)
+                            ? UpdateService.ComputeSha256Hex(File.ReadAllBytes(updateDest))
+                            : string.Empty;
+                        if (downloaded && downloadedSha == updatePayloadSha)
+                            Pass("云更新：安装包下载 + SHA256 校验通过");
+                        else
+                            Fail("云更新：安装包下载或 SHA256 校验失败。");
+                        try
+                        {
+                            File.Delete(updateDest);
+                        }
+                        catch
+                        {
+                            // ignore
+                        }
+
+                        var tamperedManifest = check.Manifest!;
+                        tamperedManifest.Installer!.Sha256 = new string('0', 64);
+                        var tamperedDest = updateDest + ".tampered";
+                        var tamperedDownloaded = updateService.DownloadAsync(
+                                tamperedManifest, tamperedDest, CancellationToken.None)
+                            .GetAwaiter().GetResult();
+                        if (!tamperedDownloaded && !File.Exists(tamperedDest))
+                            Pass("云更新：SHA256 不匹配时拒绝安装包");
+                        else
+                            Fail("云更新：SHA256 不匹配未被拒绝。");
+                    }
+                    catch (Exception ex)
+                    {
+                        Fail("云更新：本地回环测试异常：" + ex.Message);
+                    }
+                }
+            }
+
             var port = FindFreeTcpPort();
             Write($"测试端口：127.0.0.1:{port}");
 
@@ -861,6 +1049,100 @@ public static class SelfTest
             {
                 // ignore
             }
+            _cts.Dispose();
+        }
+    }
+
+    /// <summary>自测用的最小 HTTP 服务（TcpListener 实现，避免 HttpListener 的 URL ACL 依赖）。</summary>
+    private sealed class MiniHttpServer : IDisposable
+    {
+        private readonly TcpListener _listener;
+        private readonly CancellationTokenSource _cts = new();
+        private readonly Dictionary<string, Func<byte[]>> _routes =
+            new(StringComparer.OrdinalIgnoreCase);
+        private Task? _loop;
+
+        public MiniHttpServer(int port)
+        {
+            _listener = new TcpListener(IPAddress.Loopback, port);
+        }
+
+        public void SetResponse(string path, Func<byte[]> body) => _routes[path] = body;
+
+        public void Start()
+        {
+            _listener.Start();
+            _loop = Task.Run(AcceptLoopAsync);
+        }
+
+        private async Task AcceptLoopAsync()
+        {
+            try
+            {
+                while (!_cts.IsCancellationRequested)
+                {
+                    var client = await _listener.AcceptTcpClientAsync(_cts.Token);
+                    _ = Task.Run(() => HandleAsync(client));
+                }
+            }
+            catch
+            {
+                // 关闭监听时正常退出。
+            }
+        }
+
+        private async Task HandleAsync(TcpClient client)
+        {
+            try
+            {
+                using (client)
+                await using (var stream = client.GetStream())
+                {
+                    var buffer = new byte[4096];
+                    var read = await stream.ReadAsync(buffer);
+                    if (read <= 0)
+                        return;
+
+                    var request = Encoding.ASCII.GetString(buffer, 0, read);
+                    var requestLine = request.Split("\r\n")[0];
+                    var parts = requestLine.Split(' ');
+                    var path = parts.Length >= 2 ? parts[1] : "/";
+
+                    var status = "404 Not Found";
+                    var body = Array.Empty<byte>();
+                    if (_routes.TryGetValue(path, out var factory))
+                    {
+                        body = factory();
+                        status = "200 OK";
+                    }
+
+                    var header =
+                        $"HTTP/1.1 {status}\r\nContent-Length: {body.Length}\r\n" +
+                        "Connection: close\r\n\r\n";
+                    await stream.WriteAsync(Encoding.ASCII.GetBytes(header));
+                    await stream.WriteAsync(body);
+                    await stream.FlushAsync();
+                }
+            }
+            catch
+            {
+                // 客户端断开或关闭时忽略。
+            }
+        }
+
+        public void Dispose()
+        {
+            _cts.Cancel();
+            _listener.Stop();
+            try
+            {
+                _loop?.Wait(1000);
+            }
+            catch
+            {
+                // ignore
+            }
+
             _cts.Dispose();
         }
     }

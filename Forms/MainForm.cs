@@ -5,7 +5,7 @@ using NetConditioner.Services;
 
 namespace NetConditioner.Forms;
 
-public sealed class MainForm : Form
+public sealed class MainForm : Form, IUpdateHost
 {
     private static readonly Color Accent = Color.FromArgb(21, 101, 192);
     private static readonly Color Surface = Color.FromArgb(243, 247, 252);
@@ -33,6 +33,10 @@ public sealed class MainForm : Form
     private ToolStripMenuItem? _toggleMenuItem;
 
     private readonly System.Windows.Forms.Timer _statsTimer = new() { Interval = 500 };
+    private readonly UpdateCoordinator _updater = new();
+    private System.Windows.Forms.Timer? _startupUpdateTimer;
+    private System.Windows.Forms.Timer? _periodicUpdateTimer;
+    private bool _updateTickRunning;
 
     private bool _isRunning;
     private bool _isBusy;
@@ -65,6 +69,7 @@ public sealed class MainForm : Form
         _config = _store.Load(out _loadWarning);
         InitializeComponent();
         InitializeTray();
+        InitializeUpdateTimers();
 
         _conditioner.Faulted += OnConditionerFaulted;
         _statsTimer.Tick += (_, _) => UpdateStats();
@@ -573,6 +578,7 @@ public sealed class MainForm : Form
             UpdateStats();
             if (!silent)
                 ShowBalloon("已恢复网络", "弱网模拟已停止");
+            _ = RunUpdateTickAsync();
         }
     }
 
@@ -780,7 +786,7 @@ public sealed class MainForm : Form
         _hotkeyRegistered = false;
 
         using var dialog = new SettingsForm(
-            oldHotkey, _config.Settings.MaxRunMinutes, _config.Settings.MaxQueueDelayMs);
+            oldHotkey, _config.Settings.Clone(), AppVersion.Display);
         if (dialog.ShowDialog(this) != DialogResult.OK)
         {
             _hotkeyRegistered = _hotkey?.TryRegister(
@@ -807,10 +813,13 @@ public sealed class MainForm : Form
         _config.Hotkey = dialog.ResultHotkey;
         _config.Settings.MaxRunMinutes = dialog.ResultMaxRunMinutes;
         _config.Settings.MaxQueueDelayMs = dialog.ResultMaxQueueDelayMs;
+        _config.Settings.AutoUpdate = dialog.ResultAutoUpdate;
+        _config.Settings.UpdateFeedUrl = dialog.ResultUpdateFeedUrl;
         if (_isRunning)
             ScheduleAutoStop();
         SaveConfig();
         UpdateUi();
+        _ = RunUpdateTickAsync();
     }
 
     private void OnConditionerFaulted(string message)
@@ -860,6 +869,8 @@ public sealed class MainForm : Form
             _hideBalloonShown = true;
             ShowBalloon("仍在后台运行", "点击托盘图标可重新打开；退出请使用托盘菜单。");
         }
+
+        _ = RunUpdateTickAsync();
     }
 
     private void ExitApp()
@@ -899,6 +910,10 @@ public sealed class MainForm : Form
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
         _statsTimer.Dispose();
+        _startupUpdateTimer?.Dispose();
+        _startupUpdateTimer = null;
+        _periodicUpdateTimer?.Dispose();
+        _periodicUpdateTimer = null;
         _hotkey?.Dispose();
         _hotkey = null;
 
@@ -919,6 +934,67 @@ public sealed class MainForm : Form
 
         _conditioner.Dispose();
         base.OnFormClosed(e);
+    }
+
+    private void InitializeUpdateTimers()
+    {
+        UpdateService.CleanupOldFiles();
+
+        _startupUpdateTimer = new System.Windows.Forms.Timer { Interval = 5000 };
+        _startupUpdateTimer.Tick += (_, _) =>
+        {
+            _startupUpdateTimer?.Stop();
+            _startupUpdateTimer?.Dispose();
+            _startupUpdateTimer = null;
+            _ = RunUpdateTickAsync();
+        };
+        _startupUpdateTimer.Start();
+
+        _periodicUpdateTimer = new System.Windows.Forms.Timer { Interval = 6 * 60 * 60 * 1000 };
+        _periodicUpdateTimer.Tick += (_, _) => _ = RunUpdateTickAsync();
+        _periodicUpdateTimer.Start();
+    }
+
+    private async Task RunUpdateTickAsync()
+    {
+        if (_updateTickRunning || IsDisposed || Disposing)
+            return;
+
+        _updateTickRunning = true;
+        try
+        {
+            await _updater.TickAsync(_config, this);
+        }
+        catch (Exception ex)
+        {
+            UpdateService.Log("更新流程异常：" + ex.Message);
+        }
+        finally
+        {
+            _updateTickRunning = false;
+        }
+    }
+
+    bool IUpdateHost.IsIdle =>
+        !_isRunning && !_isBusy && Application.OpenForms.Count <= 1;
+
+    async Task IUpdateHost.StopEngineAsync()
+    {
+        if (_isRunning)
+            await StopAsync(silent: true);
+    }
+
+    void IUpdateHost.SaveConfig() => SaveConfig();
+
+    void IUpdateHost.ExitForUpdate() => ExitForUpdate();
+
+    private void ExitForUpdate()
+    {
+        _updateTickRunning = true;
+        _exitRequested = true;
+        _statsTimer.Stop();
+        StopEngineSync();
+        Close();
     }
 
     private static bool IsRemoteSession() => GetSystemMetrics(0x1000) != 0;

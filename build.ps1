@@ -31,6 +31,8 @@ param(
     [string]$Runtime = 'win-x64',
     [string]$Version,
     [string]$ISCCPath,
+    [string]$UpdateBaseUrl,
+    [string]$Notes,
     [switch]$Clean,
     [switch]$SkipPublish,
     [switch]$SkipInstaller
@@ -95,7 +97,10 @@ if ($Clean) {
 }
 
 Write-Host '[1/2] 编译应用程序...' -ForegroundColor Cyan
-& dotnet build $projectPath -c $Configuration --nologo
+# --disable-build-servers：.NET SDK 默认会先尝试连接常驻 MSBuild 服务器，
+# 本机该服务器起不来时会等约 8 秒超时再回退，并打印“MSBuild 服务器不可用”警告。
+# 直接用进程内生成更快，也没有这条警告。
+& dotnet build $projectPath -c $Configuration --nologo --disable-build-servers
 if ($LASTEXITCODE -ne 0) {
     throw "dotnet build 失败（退出码 $LASTEXITCODE）"
 }
@@ -117,6 +122,8 @@ $installerArgs = @{
 }
 if ($Version) { $installerArgs['Version'] = $Version }
 if ($ISCCPath) { $installerArgs['ISCCPath'] = $ISCCPath }
+if ($UpdateBaseUrl) { $installerArgs['UpdateBaseUrl'] = $UpdateBaseUrl }
+if ($Notes) { $installerArgs['Notes'] = $Notes }
 if ($SkipPublish) { $installerArgs['SkipPublish'] = $true }
 
 & $installerScript @installerArgs

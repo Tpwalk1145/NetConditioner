@@ -31,11 +31,31 @@ public sealed class AppSettings
     /// <summary>目标进程文件名（如 chrome.exe）。为空表示对所有进程生效（全局）。</summary>
     public List<string> ProcessNames { get; set; } = new();
 
+    /// <summary>latest.json 地址。为空表示关闭云更新（不联网）。</summary>
+    public string UpdateFeedUrl { get; set; } = string.Empty;
+
+    /// <summary>是否启用全静默自动更新（发现新版后后台下载并重启，不提示）。</summary>
+    public bool AutoUpdate { get; set; } = true;
+
+    /// <summary>上次检查更新的时间（Unix 秒，UTC），用于 24 小时节流。</summary>
+    public long LastUpdateCheckUnix { get; set; }
+
+    /// <summary>上次尝试升级的时间（Unix 秒，UTC）。</summary>
+    public long LastUpdateAttemptUnix { get; set; }
+
+    /// <summary>上次尝试升级的版本；同一版本失败后 24 小时内不重试。</summary>
+    public string LastAttemptedVersion { get; set; } = string.Empty;
+
     public AppSettings Clone() => new()
     {
         MaxRunMinutes = MaxRunMinutes,
         MaxQueueDelayMs = MaxQueueDelayMs,
         ProcessNames = new List<string>(ProcessNames ?? new List<string>()),
+        UpdateFeedUrl = UpdateFeedUrl,
+        AutoUpdate = AutoUpdate,
+        LastUpdateCheckUnix = LastUpdateCheckUnix,
+        LastUpdateAttemptUnix = LastUpdateAttemptUnix,
+        LastAttemptedVersion = LastAttemptedVersion,
     };
 }
 

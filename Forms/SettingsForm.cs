@@ -14,14 +14,17 @@ public sealed class SettingsForm : Form
     private readonly Label _hotkeyHint = new();
     private readonly NumericUpDown _maxRunMinutes = new();
     private readonly NumericUpDown _maxQueueDelay = new();
+    private readonly CheckBox _autoUpdate = new();
+    private readonly TextBox _updateUrlBox = new();
+    private readonly Label _versionLabel = new();
     private HotkeySettings _candidate;
 
-    public SettingsForm(HotkeySettings currentHotkey, int maxRunMinutes, int maxQueueDelayMs)
+    public SettingsForm(HotkeySettings currentHotkey, AppSettings settings, string currentVersion)
     {
         _candidate = currentHotkey.Clone();
 
         Text = "设置";
-        ClientSize = new Size(500, 330);
+        ClientSize = new Size(500, 520);
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
         MinimizeBox = false;
@@ -31,8 +34,11 @@ public sealed class SettingsForm : Form
         AutoScaleMode = AutoScaleMode.Dpi;
 
         BuildUi();
-        _maxRunMinutes.Value = Math.Clamp(maxRunMinutes, 0, 1440);
-        _maxQueueDelay.Value = Math.Clamp(maxQueueDelayMs, 0, 60000);
+        _maxRunMinutes.Value = Math.Clamp(settings.MaxRunMinutes, 0, 1440);
+        _maxQueueDelay.Value = Math.Clamp(settings.MaxQueueDelayMs, 0, 60000);
+        _autoUpdate.Checked = settings.AutoUpdate;
+        _updateUrlBox.Text = settings.UpdateFeedUrl;
+        _versionLabel.Text = $"当前版本：{currentVersion}";
     }
 
     public HotkeySettings ResultHotkey { get; private set; } = new();
@@ -40,6 +46,10 @@ public sealed class SettingsForm : Form
     public int ResultMaxRunMinutes { get; private set; }
 
     public int ResultMaxQueueDelayMs { get; private set; }
+
+    public bool ResultAutoUpdate { get; private set; }
+
+    public string ResultUpdateFeedUrl { get; private set; } = string.Empty;
 
     private void BuildUi()
     {
@@ -137,11 +147,56 @@ public sealed class SettingsForm : Form
             Size = new Size(460, 20),
         });
 
+        Controls.Add(new Label
+        {
+            Text = "软件更新",
+            Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
+            ForeColor = TextDark,
+            AutoSize = true,
+            Location = new Point(20, 290),
+        });
+
+        _autoUpdate.Text = "自动静默更新（后台下载并重启，不提示）";
+        _autoUpdate.ForeColor = TextDark;
+        _autoUpdate.AutoSize = true;
+        _autoUpdate.Location = new Point(20, 314);
+        Controls.Add(_autoUpdate);
+
+        Controls.Add(new Label
+        {
+            Text = "更新地址（latest.json）",
+            ForeColor = TextDark,
+            AutoSize = true,
+            Location = new Point(20, 346),
+        });
+
+        _updateUrlBox.Location = new Point(20, 368);
+        _updateUrlBox.Size = new Size(460, 27);
+        _updateUrlBox.PlaceholderText = "https://…/latest.json";
+        Controls.Add(_updateUrlBox);
+
+        Controls.Add(new Label
+        {
+            Text = "留空 = 关闭云更新；仅支持 https（本机回环地址可用 http 调试）。",
+            Font = new Font("Microsoft YaHei UI", 8F),
+            ForeColor = TextMuted,
+            AutoSize = false,
+            Location = new Point(20, 398),
+            Size = new Size(460, 20),
+        });
+
+        _versionLabel.Text = "当前版本：";
+        _versionLabel.Font = new Font("Microsoft YaHei UI", 8F);
+        _versionLabel.ForeColor = TextMuted;
+        _versionLabel.AutoSize = true;
+        _versionLabel.Location = new Point(20, 424);
+        Controls.Add(_versionLabel);
+
         var cancelButton = new Button
         {
             Text = "取消",
             DialogResult = DialogResult.Cancel,
-            Location = new Point(260, 288),
+            Location = new Point(260, 462),
             Size = new Size(100, 30),
             FlatStyle = FlatStyle.Flat,
             BackColor = Color.White,
@@ -152,7 +207,7 @@ public sealed class SettingsForm : Form
         var okButton = new Button
         {
             Text = "保存",
-            Location = new Point(370, 288),
+            Location = new Point(370, 462),
             Size = new Size(110, 30),
             FlatStyle = FlatStyle.Flat,
             BackColor = Accent,
@@ -215,9 +270,18 @@ public sealed class SettingsForm : Form
             return;
         }
 
+        var feedUrl = _updateUrlBox.Text.Trim();
+        if (feedUrl.Length > 0 && !UpdateService.TryValidateFeedUrl(feedUrl, out var feedError))
+        {
+            MessageBox.Show(this, feedError, "设置", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
         ResultHotkey = _candidate;
         ResultMaxRunMinutes = (int)_maxRunMinutes.Value;
         ResultMaxQueueDelayMs = (int)_maxQueueDelay.Value;
+        ResultAutoUpdate = _autoUpdate.Checked;
+        ResultUpdateFeedUrl = feedUrl;
         DialogResult = DialogResult.OK;
     }
 
