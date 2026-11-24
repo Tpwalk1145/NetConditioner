@@ -140,11 +140,18 @@ pub fn try_parse_manifest(json: &str) -> Result<(UpdateManifest, Version), Strin
 }
 
 fn build_agent(timeout: Duration) -> ureq::Agent {
+    // 必须显式指定 native-tls + 系统证书存储：ureq 默认是 rustls/WebPki，
+    // 在本项目未启用对应 feature 时 https 请求会直接 panic。
+    let tls = ureq::tls::TlsConfig::builder()
+        .provider(ureq::tls::TlsProvider::NativeTls)
+        .root_certs(ureq::tls::RootCerts::PlatformVerifier)
+        .build();
     ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .max_redirects(10)
         .user_agent("NetConditioner-Updater/1.0")
+        .tls_config(tls)
         .build()
         .into()
 }
