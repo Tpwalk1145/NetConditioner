@@ -28,7 +28,8 @@
 param(
     [string]$Configuration = 'Release',
     [string]$Version,
-    [string]$UpdateBaseUrl,
+    [string]$UpdateBaseUrl = 'https://github.com/Tpwalk1145/NetConditioner/releases/latest/download',
+    [string]$PageUrl = 'https://github.com/Tpwalk1145/NetConditioner/releases',
     [string]$Notes,
     [switch]$Clean,
     [switch]$SkipTests,
@@ -132,11 +133,10 @@ $artifact = Get-Item -LiteralPath $artifactPath
 $hash = Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256
 
 if (-not $UpdateBaseUrl) {
-    $UpdateBaseUrl = 'https://example.com/NetConditioner'
-    Write-Host ''
-    Write-Warning '未提供 -UpdateBaseUrl：latest.json 使用占位地址，上传前请改成真实地址。'
+    throw '未提供 -UpdateBaseUrl，无法生成 latest.json 中的下载地址。'
 }
 $baseUrl = $UpdateBaseUrl.TrimEnd('/')
+if (-not $PageUrl) { $PageUrl = $baseUrl }
 if (-not $Notes) { $Notes = "版本 $Version" }
 
 $manifest = [ordered]@{
@@ -144,7 +144,7 @@ $manifest = [ordered]@{
     version       = $Version
     publishedAt   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
     notes         = $Notes
-    pageUrl       = "$baseUrl/"
+    pageUrl       = $PageUrl.TrimEnd('/')
     installer     = [ordered]@{
         url    = "$baseUrl/$artifactName"
         sha256 = $hash.Hash

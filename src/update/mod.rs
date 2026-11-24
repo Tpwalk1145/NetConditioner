@@ -509,4 +509,47 @@ mod tests {
             "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD"
         );
     }
+
+    /// 真实网络联调：检查 GitHub Releases 上的清单并下载更新包。
+    /// 默认忽略，需要时执行 `cargo test --release -- --ignored`。
+    #[test]
+    #[ignore]
+    fn github_release_manifest_and_download() {
+        const FEED: &str =
+            "https://github.com/Tpwalk1145/NetConditioner/releases/latest/download/latest.json";
+
+        match check(FEED, version::current()) {
+            CheckStatus::UpdateAvailable(..) | CheckStatus::UpToDate => {}
+            CheckStatus::NotConfigured(error) | CheckStatus::Failed(error) => {
+                panic!("无法访问 GitHub 更新清单：{error}")
+            }
+        }
+
+        let agent = build_agent(CHECK_TIMEOUT);
+        let mut response = agent.get(FEED).call().expect("GET latest.json");
+        assert!((200..300).contains(&response.status().as_u16()));
+        let body = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_MANIFEST_BYTES as u64)
+            .read_to_vec()
+            .expect("读取 latest.json");
+        let (manifest, release_version) =
+            try_parse_manifest(&String::from_utf8_lossy(&body)).expect("解析 latest.json");
+        println!("GitHub 上的最新版本：{}", release_version.format());
+
+        let destination = std::env::temp_dir().join("NetConditioner-github-download-test.exe");
+        let _ = fs::remove_file(&destination);
+        assert!(download(&manifest, &destination), "下载更新包失败");
+
+        let bytes = fs::read(&destination).expect("读取下载的更新包");
+        let actual = compute_sha256_hex(&bytes);
+        let installer = manifest.installer.as_ref().expect("installer");
+        assert_eq!(actual, installer.sha256.as_deref().unwrap_or_default());
+        if installer.size > 0 {
+            assert_eq!(bytes.len() as i64, installer.size);
+        }
+
+        let _ = fs::remove_file(&destination);
+    }
 }

@@ -4,6 +4,13 @@ Windows 系统级弱网模拟工具：通过全局热键一键开启/停止上�
 
 本仓库是 2.1.0 的 **Rust 单文件版**：只有一个 exe，内置 WinDivert 运行时，不需要安装包、不需要 .NET 运行时；首次运行会把内置的 WinDivert.dll / WinDivert64.sys 解压到本机运行时目录（约 140 KB），之后直接复用。
 
+## 下载
+
+- 版本与更新记录：<https://github.com/Tpwalk1145/NetConditioner/releases>
+- 直接下载单文件 exe：<https://github.com/Tpwalk1145/NetConditioner/releases/latest/download/NetConditioner-2.1.0-win-x64.exe>
+
+下载后放到任意可写目录双击即可运行（首次运行会弹 UAC 请求管理员权限）。
+
 ## 功能
 
 - 单文件分发：整个程序就是一个 NetConditioner.exe，拷贝到任意目录双击即可运行
@@ -111,7 +118,8 @@ build.ps1 常用参数：
 | 参数 | 说明 |
 | --- | --- |
 | -Version 2.1.1 | 指定产物文件名与 latest.json 版本（默认取 Cargo.toml 的 version）；exe 内嵌版本始终来自 Cargo.toml，不一致时会警告 |
-| -UpdateBaseUrl <url> | 云更新地址前缀；生成 latest.json 时用作更新包 URL（默认占位地址，上传前需替换） |
+| -UpdateBaseUrl <url> | 云更新地址前缀，生成 latest.json 时用作更新包 URL（默认是本仓库的 GitHub Releases 固定地址） |
+| -PageUrl <url> | latest.json 里的 pageUrl，默认是本仓库的 Releases 页面 |
 | -Notes <文本> | 写进 latest.json 的更新说明 |
 | -Clean | 先删除 target / dist 再构建 |
 | -SkipTests | 不运行 cargo test |
@@ -125,15 +133,15 @@ build.ps1 常用参数：
       "version": "2.1.1",
       "publishedAt": "2026-11-24T00:00:00Z",
       "notes": "修复若干问题",
-      "pageUrl": "https://你的域名/NetConditioner/",
+      "pageUrl": "https://github.com/Tpwalk1145/NetConditioner/releases",
       "installer": {
-        "url": "https://你的域名/NetConditioner/NetConditioner-2.1.1-win-x64.exe",
+        "url": "https://github.com/Tpwalk1145/NetConditioner/releases/latest/download/NetConditioner-2.1.1-win-x64.exe",
         "sha256": "D9C7F19E...",
         "size": 2215424
       }
     }
 
-把 exe 和 latest.json 上传到同一目录即可。任意静态托管（对象存储、Nginx、GitHub Releases）都可以；用 GitHub Releases 时可以用固定地址 https://github.com/<用户>/<仓库>/releases/latest/download/latest.json。
+把 exe 和 latest.json 上传到同一个 GitHub Release 就行（本仓库就是这么发布的，所以能一直用 releases/latest/download/... 这个固定地址）。也可以用任意静态托管（对象存储、Nginx 等），规则同样是两个文件同目录。
 
 ## 云更新（静默自替换）
 
@@ -154,10 +162,20 @@ build.ps1 常用参数：
 
 | 项 | 说明 |
 | --- | --- |
-| 更新地址（latest.json） | 例如 https://你的域名/NetConditioner/latest.json；留空 = 关闭云更新（默认） |
+| 更新地址（latest.json） | 例如 https://github.com/Tpwalk1145/NetConditioner/releases/latest/download/latest.json；留空 = 关闭云更新（默认） |
 | 自动静默更新 | 默认开启；关闭后不会检查更新 |
 
 仅支持 https；本机回环地址（http://127.0.0.1:...）允许 http，便于本地联调。
+
+### 网络访问
+
+程序用的是 Windows 自己的证书存储做 HTTPS 校验（和 WinHTTP / .NET 一致，不做在线吊销检查），所以只要系统层面能访问 GitHub，云更新就能直连，**不需要内置镜像源**：
+
+- 用 Steam++ / Watt Toolkit 之类的加速器（把域名指到本机 443 端口）可以直连；
+- 系统代理、正确的 hosts 记录同样可以；
+- 完全访问不到 GitHub 的网络，可以把更新地址换成任意能访问的 https 静态托管，把 exe 和 latest.json 放同一目录。
+
+补充：curl 会在线检查证书吊销状态，在加速器环境下可能报 `0x80092012`（无法检查吊销），这只是 curl 自己的校验策略；本程序走的是只查缓存的策略，不受影响。
 
 ### 诊断
 
