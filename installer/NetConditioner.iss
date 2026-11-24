@@ -1,4 +1,4 @@
-﻿; NetConditioner 安装包脚本（Inno Setup 6.7+）
+; NetConditioner 安装包脚本（Inno Setup 6.7+）
 ; 由 installer\build-installer.ps1 调用 ISCC.exe 编译。
 
 #define AppId "{{7E1F4A9C-3D2B-4B8E-9F6A-1C5D2E8B7A34}"
@@ -49,7 +49,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\publish\win-x64-selfcontained\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\publish\win-x64\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Icons]

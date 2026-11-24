@@ -1,28 +1,25 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Build the NetConditioner Windows installer.
 
 .DESCRIPTION
-    1. dotnet publish the WinForms app for win-x64 with NativeAOT
-       (single native exe; the target machine needs no .NET runtime).
-    2. Compile installer\NetConditioner.iss with Inno Setup 6 (ISCC.exe).
-    3. Write dist\NetConditioner-<version>-win-x64-Setup.exe.
+    1. cargo build（Release）并暂存单文件 exe + WinDivert 文件到 publish\win-x64。
+    2. 调用 Inno Setup 6 的 ISCC.exe 编译 installer\NetConditioner.iss。
+    3. 生成 dist\NetConditioner-<version>-win-x64-Setup.exe 与 dist\latest.json。
 
-    Inno Setup 6 is required: winget install JRSoftware.InnoSetup
-    ISCC.exe is located on PATH, under INNO_SETUP_HOME, or in the default
-    per-user / per-machine install folders. Use -ISCCPath to override.
+    依赖：Rust MSVC 工具链、Inno Setup 6（winget install JRSoftware.InnoSetup）。
+    ISCC.exe 会从 PATH、INNO_SETUP_HOME 或默认安装目录查找，也可用 -ISCCPath 指定。
 
 .EXAMPLE
     .\installer\build-installer.ps1
 
 .EXAMPLE
-    .\installer\build-installer.ps1 -SkipPublish -Version 1.0.1
+    .\installer\build-installer.ps1 -SkipPublish -Version 2.0.1
 #>
 [CmdletBinding()]
 param(
     [string]$Configuration = 'Release',
-    [string]$Runtime = 'win-x64',
     [string]$Version,
     [string]$ISCCPath,
     [string]$UpdateBaseUrl,
@@ -33,10 +30,11 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$projectPath = Join-Path $repoRoot 'NetConditioner.csproj'
-$payloadDir = Join-Path $repoRoot 'publish\win-x64-selfcontained'
+$cargoToml = Join-Path $repoRoot 'Cargo.toml'
+$payloadDir = Join-Path $repoRoot 'publish\win-x64'
 $distDir = Join-Path $repoRoot 'dist'
 $issPath = Join-Path $PSScriptRoot 'NetConditioner.iss'
+$targetDir = Join-Path $repoRoot (Join-Path 'target' $(if ($Configuration -eq 'Release') { 'release' } else { 'debug' }))
 
 function Resolve-Iscc {
     param([string]$Explicit)
@@ -55,8 +53,7 @@ function Resolve-Iscc {
     if ($env:INNO_SETUP_HOME) {
         $candidates += (Join-Path $env:INNO_SETUP_HOME 'ISCC.exe')
     }
-    $perUser = Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe'
-    $candidates += $perUser
+    $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
     $programFiles = [Environment]::GetFolderPath('ProgramFiles')
     $programFilesX86 = [Environment]::GetFolderPath('ProgramFilesX86')
     if ($programFilesX86) {
@@ -74,9 +71,8 @@ function Resolve-Iscc {
 }
 
 if (-not $Version) {
-    [xml]$projectXml = Get-Content -LiteralPath $projectPath -Raw
-    $versionElement = $projectXml.Project.PropertyGroup.Version | Select-Object -First 1
-    if ($versionElement) { $Version = [string]$versionElement } else { $Version = '1.0.0' }
+    $match = Select-String -LiteralPath $cargoToml -Pattern '^\s*version\s*=\s*"([^"]+)"' | Select-Object -First 1
+    if ($match) { $Version = $match.Matches[0].Groups[1].Value } else { $Version = '0.0.0' }
 }
 
 # VersionInfoVersion in the .iss must be a 4-part numeric version.
@@ -90,32 +86,46 @@ while ($numericParts.Count -lt 4) { $numericParts += '0' }
 $appVersionNumeric = ($numericParts[0..3] -join '.')
 
 Write-Host 'NetConditioner installer build'
-Write-Host "  Project : $projectPath"
-Write-Host "  Version : $Version"
-Write-Host "  Runtime : $Runtime (NativeAOT, self-contained)"
-Write-Host "  Payload : $payloadDir"
-Write-Host "  Output  : $distDir"
+Write-Host "  Cargo.toml : $cargoToml"
+Write-Host "  Version    : $Version"
+Write-Host "  Config     : $Configuration"
+Write-Host "  Payload    : $payloadDir"
+Write-Host "  Output     : $distDir"
 Write-Host ''
 
 if (-not $SkipPublish) {
-    Write-Host '[1/3] Publishing NativeAOT application...'
+    Write-Host '[1/3] Building native executable...'
+    $cargoArgs = @('build')
+    if ($Configuration -eq 'Release') { $cargoArgs += '--release' }
+    & cargo @cargoArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build failed with exit code $LASTEXITCODE"
+    }
+
     if (Test-Path -LiteralPath $payloadDir) {
         Remove-Item -LiteralPath $payloadDir -Recurse -Force
     }
-    # PublishProfile=Aot 打开 PublishAot + StripSymbols；不能写进 csproj，
-    # 否则 dotnet build 会因 Windows 窗体 + 剪裁检查（NETSDK1175）而失败。
-    # --disable-build-servers：避免 SDK 等待 MSBuild 服务器连接超时（约 8 秒）并打印警告。
-    & dotnet publish $projectPath -c $Configuration -r $Runtime -p:PublishProfile=Aot -p:DebugType=None -p:DebugSymbols=false -o $payloadDir --disable-build-servers
-    if ($LASTEXITCODE -ne 0) {
-        throw "dotnet publish failed with exit code $LASTEXITCODE"
+    New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $payloadDir 'third_party\WinDivert') | Out-Null
+
+    $executable = Join-Path $targetDir 'NetConditioner.exe'
+    if (-not (Test-Path -LiteralPath $executable)) {
+        throw "Executable not found: $executable"
     }
-}
-else {
-    Write-Host '[1/3] Skipping publish (-SkipPublish).'
+    Copy-Item -LiteralPath $executable -Destination (Join-Path $payloadDir 'NetConditioner.exe') -Force
+
+    $thirdParty = Join-Path $repoRoot 'third_party\WinDivert'
+    foreach ($name in @('WinDivert.dll', 'WinDivert64.sys')) {
+        Copy-Item -LiteralPath (Join-Path $thirdParty $name) -Destination (Join-Path $payloadDir $name) -Force
+    }
+    foreach ($name in @('LICENSE', 'VERSION', 'README.txt')) {
+        Copy-Item -LiteralPath (Join-Path $thirdParty $name) -Destination (Join-Path $payloadDir "third_party\WinDivert\$name") -Force
+    }
+} else {
+    Write-Host '[1/3] Skipping build (-SkipPublish).'
 }
 
 Write-Host '[2/3] Validating payload...'
-# NativeAOT 发布只产出原生 exe（没有 runtimeconfig.json / deps.json）。
 $requiredFiles = @(
     'NetConditioner.exe',
     'WinDivert.dll',
@@ -145,7 +155,6 @@ $setupPath = Join-Path $distDir "NetConditioner-$Version-win-x64-Setup.exe"
 if (-not (Test-Path -LiteralPath $setupPath)) {
     throw "Installer output was not found: $setupPath"
 }
-
 
 $setup = Get-Item -LiteralPath $setupPath
 $hash = Get-FileHash -LiteralPath $setupPath -Algorithm SHA256
@@ -187,3 +196,4 @@ Write-Host "  Path   : $manifestPath"
 Write-Host "  URL    : $baseUrl/$($setup.Name)"
 Write-Host "  SHA256 : $($hash.Hash)"
 Write-Host '  上传时把 Setup exe 和 latest.json 放在同一目录。'
+
