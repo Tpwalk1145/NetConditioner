@@ -5,8 +5,10 @@ mod checkupdate;
 mod config;
 mod engine;
 mod hotkey;
+mod licenses;
 mod neturl;
 mod selftest;
+mod selfupdate;
 mod ui;
 mod update;
 mod version;
@@ -19,6 +21,19 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has_flag = |flag: &str| args.iter().any(|arg| arg.eq_ignore_ascii_case(flag));
+
+    // 自更新助手：不创建互斥体、不弹 UI，等旧进程退出后替换自身并重启。
+    if selfupdate::is_helper_mode(&args) {
+        let code = match selfupdate::parse_args(&args) {
+            Some(apply) => selfupdate::run_helper(&apply),
+            None => 2,
+        };
+        std::process::exit(code);
+    }
+
+    if has_flag("--licenses") {
+        std::process::exit(licenses::run());
+    }
 
     if has_flag("--self-test") {
         std::process::exit(selftest::run());

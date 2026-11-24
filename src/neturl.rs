@@ -45,13 +45,13 @@ pub fn is_loopback(url: &url::Url) -> bool {
     false
 }
 
-/// 安装包地址：必须 https，或本机回环 http。
+/// 更新包地址：必须 https，或本机回环 http。
 pub fn validate_installer_url(url: &str) -> Result<url::Url, String> {
-    let parsed = url::Url::parse(url).map_err(|_| "安装包地址无效。".to_string())?;
+    let parsed = url::Url::parse(url).map_err(|_| "更新包地址无效。".to_string())?;
     match parsed.scheme() {
         "https" => Ok(parsed),
         "http" if is_loopback(&parsed) => Ok(parsed),
-        _ => Err("安装包地址必须使用 https。".to_string()),
+        _ => Err("更新包地址必须使用 https。".to_string()),
     }
 }
 

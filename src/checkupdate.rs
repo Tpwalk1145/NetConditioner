@@ -41,7 +41,7 @@ pub fn run() -> i32 {
                     manifest.version.clone().unwrap_or_default()
                 ));
                 push(format!(
-                    "安装包：{}",
+                    "更新包：{}",
                     manifest
                         .installer
                         .as_ref()

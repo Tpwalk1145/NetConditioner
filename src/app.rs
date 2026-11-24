@@ -701,7 +701,7 @@ impl App {
         self.updater.install_started = true;
         self.updater.deferred_logged = false;
         UpdateService::log(&format!(
-            "开始静默安装版本 {}。",
+            "开始自更新到版本 {}。",
             manifest.version.clone().unwrap_or_default()
         ));
 
@@ -712,9 +712,9 @@ impl App {
         self.config.settings.last_attempted_version = manifest.version.clone().unwrap_or_default();
         self.save_config();
 
-        if !UpdateService::launch_installer_silently(&installer) {
+        if !UpdateService::apply_self_update(&installer) {
             self.updater.install_started = false;
-            UpdateService::log("启动安装失败，继续使用当前版本。");
+            UpdateService::log("启动自更新失败，继续使用当前版本。");
             return;
         }
 

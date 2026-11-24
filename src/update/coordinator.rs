@@ -106,7 +106,7 @@ fn run_tick(feed_url: &str, current: Version, snapshot: &UpdateSettingsSnapshot)
             }
 
             UpdateService::log(&format!("发现新版本 {version_text}，开始下载。"));
-            let destination = UpdateService::installer_path(&version_text);
+            let destination = UpdateService::payload_path(&version_text);
             if !UpdateService::download(&manifest, &destination) {
                 return TickOutcome::DownloadFailed { manifest, now };
             }

@@ -1,54 +1,44 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    NetConditioner 一键构建：cargo 编译 -> 发布 -> Inno Setup 安装包。
+    NetConditioner 一键构建：cargo 编译 + 测试 + 生成单文件 exe（可选生成云更新清单）。
 
 .DESCRIPTION
-    根目录构建入口，默认按顺序执行：
+    默认按顺序执行：
       1. cargo build（Release）
       2. cargo test（可用 -SkipTests 跳过）
-      3. installer\build-installer.ps1：发布单文件 exe 并调用 ISCC.exe 打包
+      3. 把 target\release\NetConditioner.exe 复制为
+         dist\NetConditioner-<version>-win-x64.exe，并生成 dist\latest.json
 
-    产物：dist\NetConditioner-<version>-win-x64-Setup.exe 与 dist\latest.json
+    单文件版已内置 WinDivert 运行时，首次运行会自动解压到
+    %ProgramFiles%\NetConditioner\runtime\<版本>\，不再需要安装包。
 
-    依赖：Rust（MSVC 工具链，需要 VS2022 Build Tools + Windows SDK）、Inno Setup 6。
-
-.PARAMETER Configuration
-    Release（默认）或 Debug。
-
-.PARAMETER Version
-    安装包/manifest 版本号；默认从 Cargo.toml 读取。exe 内嵌版本始终是 Cargo.toml 的值。
-
-.PARAMETER Clean
-    先删除 target / publish / dist 再构建。
+    依赖：Rust（MSVC 工具链，需要 VS2022 Build Tools + Windows SDK）。
 
 .EXAMPLE
     .\build.ps1
 
 .EXAMPLE
-    .\build.ps1 -Version 2.0.1 -Clean
+    .\build.ps1 -Version 2.1.1 -Clean
 
 .EXAMPLE
-    .\build.ps1 -SkipInstaller     # 只编译（并跑测试），不发布、不打包
+    .\build.ps1 -SkipPackage      # 只编译（并跑测试），不生成 dist 产物
 #>
 [CmdletBinding()]
 param(
     [string]$Configuration = 'Release',
     [string]$Version,
-    [string]$ISCCPath,
     [string]$UpdateBaseUrl,
     [string]$Notes,
     [switch]$Clean,
     [switch]$SkipTests,
-    [switch]$SkipPublish,
-    [switch]$SkipInstaller
+    [switch]$SkipPackage
 )
 
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = $PSScriptRoot
 $cargoToml = Join-Path $repoRoot 'Cargo.toml'
-$installerScript = Join-Path $repoRoot 'installer\build-installer.ps1'
 $distDir = Join-Path $repoRoot 'dist'
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
@@ -59,24 +49,8 @@ function Get-CargoVersion {
     return $match.Matches[0].Groups[1].Value
 }
 
-function Test-InnoSetupAvailable {
-    if ($ISCCPath) { return (Test-Path -LiteralPath $ISCCPath) }
-    if (Get-Command ISCC.exe -ErrorAction SilentlyContinue) { return $true }
-
-    $candidates = @()
-    if ($env:INNO_SETUP_HOME) { $candidates += (Join-Path $env:INNO_SETUP_HOME 'ISCC.exe') }
-    $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
-    foreach ($programFiles in @([Environment]::GetFolderPath('ProgramFilesX86'), [Environment]::GetFolderPath('ProgramFiles'))) {
-        if ($programFiles) { $candidates += (Join-Path $programFiles 'Inno Setup 6\ISCC.exe') }
-    }
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) { return $true }
-    }
-    return $false
-}
-
 Write-Host '========================================' -ForegroundColor Cyan
-Write-Host ' NetConditioner 构建' -ForegroundColor Cyan
+Write-Host ' NetConditioner 构建（单文件版）' -ForegroundColor Cyan
 Write-Host '========================================' -ForegroundColor Cyan
 
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
@@ -85,18 +59,12 @@ if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
 if (-not (Test-Path -LiteralPath $cargoToml)) {
     throw "未找到项目文件：$cargoToml"
 }
-if (-not $SkipInstaller -and -not (Test-Path -LiteralPath $installerScript)) {
-    throw "未找到打包脚本：$installerScript"
-}
-if (-not $SkipInstaller -and -not (Test-InnoSetupAvailable)) {
-    throw '未找到 Inno Setup 6（ISCC.exe）。请先安装：winget install JRSoftware.InnoSetup，或用 -ISCCPath 指定路径。'
-}
 
 $cargoVersion = Get-CargoVersion -Path $cargoToml
 if (-not $Version) {
     $Version = $cargoVersion
 } elseif ($Version -ne $cargoVersion) {
-    Write-Warning "Cargo.toml 中的版本是 $cargoVersion；exe 内嵌版本不会随 -Version 改变，只有安装包/latest.json 使用 $Version。"
+    Write-Warning "Cargo.toml 中的版本是 $cargoVersion；exe 内嵌版本不会随 -Version 改变，只有文件名/latest.json 使用 $Version。"
 }
 
 Write-Host "  cargo    : $(cargo --version)"
@@ -106,8 +74,8 @@ Write-Host "  版本     : $Version（Cargo.toml: $cargoVersion）"
 Write-Host ''
 
 if ($Clean) {
-    Write-Host '清理 target / publish / dist ...' -ForegroundColor DarkGray
-    foreach ($name in @('target', 'publish', 'dist')) {
+    Write-Host '清理 target / dist ...' -ForegroundColor DarkGray
+    foreach ($name in @('target', 'dist')) {
         $path = Join-Path $repoRoot $name
         if (-not (Test-Path -LiteralPath $path)) { continue }
         try {
@@ -126,13 +94,6 @@ if ($LASTEXITCODE -ne 0) {
     throw "cargo build 失败（退出码 $LASTEXITCODE）"
 }
 
-# 开发便利：把 WinDivert 文件放到 exe 同目录，便于直接从 target 运行。
-$outputDir = Join-Path $repoRoot (Join-Path 'target' $(if ($Configuration -eq 'Release') { 'release' } else { 'debug' }))
-$thirdParty = Join-Path $repoRoot 'third_party\WinDivert'
-foreach ($name in @('WinDivert.dll', 'WinDivert64.sys')) {
-    Copy-Item -LiteralPath (Join-Path $thirdParty $name) -Destination (Join-Path $outputDir $name) -Force -ErrorAction SilentlyContinue
-}
-
 if (-not $SkipTests) {
     Write-Host ''
     Write-Host '[2/3] 运行单元测试...' -ForegroundColor Cyan
@@ -146,48 +107,65 @@ if (-not $SkipTests) {
     Write-Host '[2/3] 已跳过测试（-SkipTests）。' -ForegroundColor DarkGray
 }
 
-if ($SkipInstaller) {
+$targetDir = Join-Path $repoRoot (Join-Path 'target' $(if ($Configuration -eq 'Release') { 'release' } else { 'debug' }))
+$executable = Join-Path $targetDir 'NetConditioner.exe'
+if (-not (Test-Path -LiteralPath $executable)) {
+    throw "未找到编译产物：$executable"
+}
+
+if ($SkipPackage) {
     $stopwatch.Stop()
     Write-Host ''
-    Write-Host "构建完成（已跳过安装包），耗时 $([math]::Round($stopwatch.Elapsed.TotalSeconds, 1)) 秒。" -ForegroundColor Green
-    Write-Host "输出：$outputDir"
+    Write-Host "构建完成（已跳过打包），耗时 $([math]::Round($stopwatch.Elapsed.TotalSeconds, 1)) 秒。" -ForegroundColor Green
+    Write-Host "输出：$executable"
     return
 }
 
 Write-Host ''
-Write-Host '[3/3] 发布并打包安装包...' -ForegroundColor Cyan
+Write-Host '[3/3] 生成单文件产物与更新清单...' -ForegroundColor Cyan
+New-Item -ItemType Directory -Force -Path $distDir | Out-Null
+$artifactName = "NetConditioner-$Version-win-x64.exe"
+$artifactPath = Join-Path $distDir $artifactName
+Copy-Item -LiteralPath $executable -Destination $artifactPath -Force
 
-$installerArgs = @{
-    Configuration = $Configuration
-    Version       = $Version
-}
-if ($ISCCPath) { $installerArgs['ISCCPath'] = $ISCCPath }
-if ($UpdateBaseUrl) { $installerArgs['UpdateBaseUrl'] = $UpdateBaseUrl }
-if ($Notes) { $installerArgs['Notes'] = $Notes }
-if ($SkipPublish) { $installerArgs['SkipPublish'] = $true }
+$artifact = Get-Item -LiteralPath $artifactPath
+$hash = Get-FileHash -LiteralPath $artifactPath -Algorithm SHA256
 
-& $installerScript @installerArgs
-if ($LASTEXITCODE -ne 0) {
-    throw "打包脚本失败（退出码 $LASTEXITCODE）"
+if (-not $UpdateBaseUrl) {
+    $UpdateBaseUrl = 'https://example.com/NetConditioner'
+    Write-Host ''
+    Write-Warning '未提供 -UpdateBaseUrl：latest.json 使用占位地址，上传前请改成真实地址。'
 }
+$baseUrl = $UpdateBaseUrl.TrimEnd('/')
+if (-not $Notes) { $Notes = "版本 $Version" }
+
+$manifest = [ordered]@{
+    schemaVersion = 2
+    version       = $Version
+    publishedAt   = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    notes         = $Notes
+    pageUrl       = "$baseUrl/"
+    installer     = [ordered]@{
+        url    = "$baseUrl/$artifactName"
+        sha256 = $hash.Hash
+        size   = $artifact.Length
+    }
+}
+
+$manifestPath = Join-Path $distDir 'latest.json'
+$manifestJson = ($manifest | ConvertTo-Json -Depth 5) + [Environment]::NewLine
+[System.IO.File]::WriteAllText(
+    $manifestPath, $manifestJson, (New-Object System.Text.UTF8Encoding($false)))
 
 $stopwatch.Stop()
-$setupPath = Join-Path $distDir "NetConditioner-$Version-win-x64-Setup.exe"
-if (-not (Test-Path -LiteralPath $setupPath)) {
-    $setupPath = Get-ChildItem -LiteralPath $distDir -Filter '*Setup.exe' -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1 -ExpandProperty FullName
-}
-
 Write-Host ''
 Write-Host '========================================' -ForegroundColor Green
 Write-Host ' 构建完成' -ForegroundColor Green
 Write-Host '========================================' -ForegroundColor Green
 Write-Host "  耗时   : $([math]::Round($stopwatch.Elapsed.TotalSeconds, 1)) 秒"
-if ($setupPath -and (Test-Path -LiteralPath $setupPath)) {
-    $setup = Get-Item -LiteralPath $setupPath
-    Write-Host "  安装包 : $($setup.FullName)"
-    Write-Host "  大小   : $([math]::Round($setup.Length / 1MB, 2)) MB"
-    Write-Host "  清单   : $(Join-Path $distDir 'latest.json')"
-}
+Write-Host "  单文件 : $($artifact.FullName)"
+Write-Host "  大小   : $([math]::Round($artifact.Length / 1MB, 2)) MB"
+Write-Host "  SHA256 : $($hash.Hash)"
+Write-Host "  清单   : $manifestPath"
+Write-Host '  分发时只需要上传这个 exe 和 latest.json。'
 

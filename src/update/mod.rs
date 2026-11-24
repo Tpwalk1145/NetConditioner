@@ -1,4 +1,4 @@
-//! 云更新的网络与安装部分（对应原 UpdateService）。
+//! 云更新的网络与自更新部分（对应原 UpdateService，单文件版）。
 
 pub mod coordinator;
 
@@ -15,11 +15,8 @@ use crate::version::{self, Version};
 
 pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 pub const MAX_INSTALLER_BYTES: i64 = 300 * 1024 * 1024;
-const INNO_APP_ID: &str = "7E1F4A9C-3D2B-4B8E-9F6A-1C5D2E8B7A34";
 const CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
-
-const APPLY_UPDATE_SCRIPT: &str = "@echo off\r\nping -n 3 127.0.0.1 >nul\r\n\"%NC_SETUP%\" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- /LOG=\"%NC_LOG%\"\r\nif exist \"%NC_APP%\" start \"\" \"%NC_APP%\"\r\ndel \"%~f0\" >nul 2>&1\r\n";
 
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
@@ -30,7 +27,7 @@ pub struct UpdateInstallerInfo {
 }
 
 fn default_schema_version() -> i32 {
-    1
+    2
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -64,8 +61,8 @@ pub fn log_path() -> PathBuf {
     update_directory().join("update.log")
 }
 
-pub fn installer_path(version: &str) -> PathBuf {
-    update_directory().join(format!("NetConditioner-{version}-win-x64-Setup.exe"))
+pub fn payload_path(version: &str) -> PathBuf {
+    update_directory().join(format!("NetConditioner-{version}-win-x64.exe"))
 }
 
 pub fn is_dry_run() -> bool {
@@ -91,7 +88,7 @@ pub fn try_parse_manifest(json: &str) -> Result<(UpdateManifest, Version), Strin
     let mut manifest: UpdateManifest =
         serde_json::from_str(json).map_err(|_| "更新信息不是有效的 JSON。".to_string())?;
 
-    if manifest.schema_version != 1 {
+    if manifest.schema_version != 2 {
         return Err(format!(
             "不支持的更新信息版本：{}。",
             manifest.schema_version
@@ -107,12 +104,12 @@ pub fn try_parse_manifest(json: &str) -> Result<(UpdateManifest, Version), Strin
     let installer = manifest
         .installer
         .as_mut()
-        .ok_or_else(|| "更新信息缺少安装包信息。".to_string())?;
+        .ok_or_else(|| "更新信息缺少更新包信息。".to_string())?;
 
     let url = installer
         .url
         .as_deref()
-        .ok_or_else(|| "安装包地址无效。".to_string())?;
+        .ok_or_else(|| "更新包地址无效。".to_string())?;
     let parsed_url = neturl::validate_installer_url(url)?;
 
     let sha256 = installer
@@ -122,7 +119,7 @@ pub fn try_parse_manifest(json: &str) -> Result<(UpdateManifest, Version), Strin
         .ok_or_else(|| "更新信息中的 SHA256 无效。".to_string())?;
 
     if installer.size < 0 || installer.size > MAX_INSTALLER_BYTES {
-        return Err("安装包大小超出允许范围。".to_string());
+        return Err("更新包大小超出允许范围。".to_string());
     }
 
     if let Some(notes) = &manifest.notes {
@@ -204,14 +201,14 @@ fn part_path(destination: &Path) -> PathBuf {
     PathBuf::from(text)
 }
 
-/// 下载安装包到 destination，边下边算 SHA256，校验 size 与哈希后原子落盘。
+/// 下载更新包到 destination，边下边算 SHA256，校验 size 与哈希后原子落盘。
 pub fn download(manifest: &UpdateManifest, destination: &Path) -> bool {
     let Some(installer) = manifest.installer.as_ref() else {
-        log("下载失败：安装包地址或 SHA256 无效。");
+        log("下载失败：更新包地址或 SHA256 无效。");
         return false;
     };
     let Some(url) = installer.url.as_deref() else {
-        log("下载失败：安装包地址或 SHA256 无效。");
+        log("下载失败：更新包地址或 SHA256 无效。");
         return false;
     };
     let Some(expected) = installer
@@ -219,7 +216,7 @@ pub fn download(manifest: &UpdateManifest, destination: &Path) -> bool {
         .as_deref()
         .and_then(neturl::try_normalize_sha256)
     else {
-        log("下载失败：安装包地址或 SHA256 无效。");
+        log("下载失败：更新包地址或 SHA256 无效。");
         return false;
     };
 
@@ -266,18 +263,18 @@ pub fn download(manifest: &UpdateManifest, destination: &Path) -> bool {
                 Ok(0) => break,
                 Ok(read) => read,
                 Err(error) => {
-                    fail_reason = format!("读取安装包失败：{error}");
+                    fail_reason = format!("读取更新包失败：{error}");
                     break;
                 }
             };
             total += read as u64;
             if total > MAX_INSTALLER_BYTES as u64 {
-                fail_reason = "安装包超过允许的最大体积。".to_string();
+                fail_reason = "更新包超过允许的最大体积。".to_string();
                 break;
             }
             hasher.update(&buffer[..read]);
             if let Err(error) = file.write_all(&buffer[..read]) {
-                fail_reason = format!("写入安装包失败：{error}");
+                fail_reason = format!("写入更新包失败：{error}");
                 break;
             }
         }
@@ -285,7 +282,7 @@ pub fn download(manifest: &UpdateManifest, destination: &Path) -> bool {
 
     if fail_reason.is_empty() {
         if let Err(error) = file.flush() {
-            fail_reason = format!("写入安装包失败：{error}");
+            fail_reason = format!("写入更新包失败：{error}");
         } else {
             let actual = to_hex(&hasher.finalize());
             if installer.size > 0 && total != installer.size as u64 {
@@ -309,6 +306,9 @@ pub fn download(manifest: &UpdateManifest, destination: &Path) -> bool {
         return false;
     }
 
+    // 去掉 Mark-of-the-Web，避免静默启动新版本时被 SmartScreen 拦截。
+    crate::selfupdate::remove_zone_identifier(destination);
+
     log(&format!(
         "下载完成并校验通过：{}（{total} 字节）",
         destination.display()
@@ -316,145 +316,43 @@ pub fn download(manifest: &UpdateManifest, destination: &Path) -> bool {
     true
 }
 
-fn resolve_install_directory() -> PathBuf {
-    if let Some(location) = registry_install_location() {
-        return PathBuf::from(location);
-    }
-
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            if directory.join("unins000.exe").exists() {
-                return directory.to_path_buf();
-            }
-        }
-    }
-
-    let program_files = std::env::var_os("ProgramFiles")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\Program Files"));
-    program_files.join("NetConditioner")
-}
-
-fn registry_install_location() -> Option<String> {
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_READ,
-        KEY_WOW64_64KEY, REG_SZ,
-    };
-
-    let subkey = crate::win::wide(&format!(
-        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\{{{INNO_APP_ID}}}_is1"
-    ));
-
-    unsafe {
-        let mut key: HKEY = std::ptr::null_mut();
-        let result = RegOpenKeyExW(
-            HKEY_LOCAL_MACHINE,
-            subkey.as_ptr(),
-            0,
-            KEY_READ | KEY_WOW64_64KEY,
-            &mut key,
-        );
-        if result != 0 {
-            return None;
-        }
-
-        let value_name = crate::win::wide("InstallLocation");
-        let mut kind: u32 = 0;
-        let mut size: u32 = 0;
-        let result = RegQueryValueExW(
-            key,
-            value_name.as_ptr(),
-            std::ptr::null(),
-            &mut kind,
-            std::ptr::null_mut(),
-            &mut size,
-        );
-        if result != 0 || size == 0 {
-            RegCloseKey(key);
-            return None;
-        }
-
-        let mut buffer = vec![0u8; size as usize];
-        let result = RegQueryValueExW(
-            key,
-            value_name.as_ptr(),
-            std::ptr::null(),
-            &mut kind,
-            buffer.as_mut_ptr(),
-            &mut size,
-        );
-        RegCloseKey(key);
-
-        if result != 0 || kind != REG_SZ {
-            return None;
-        }
-
-        let utf16: Vec<u16> = buffer
-            .chunks_exact(2)
-            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-            .collect();
-        let text = crate::win::buffer_to_string(&utf16).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    }
-}
-
-/// 写一个隐藏执行的批处理，静默安装并重启新版。路径全部通过环境变量传入。
-pub fn launch_installer_silently(installer: &Path) -> bool {
-    use std::os::windows::process::CommandExt;
-
-    if !installer.exists() {
-        log(&format!("安装包不存在：{}", installer.display()));
-        return false;
-    }
-
-    let directory = update_directory();
-    let _ = fs::create_dir_all(&directory);
-
-    let install_dir = resolve_install_directory();
-    let app_path = install_dir.join("NetConditioner.exe");
-    let script_path = directory.join("apply-update.cmd");
-    let install_log = directory.join(format!(
-        "install-{}.log",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    ));
-
-    if let Err(error) = fs::write(&script_path, APPLY_UPDATE_SCRIPT) {
-        log(&format!("启动静默安装失败：{error}"));
-        return false;
-    }
-
+/// 启动自更新助手：等待当前进程退出后把新 exe 覆盖到自身位置并重启。
+pub fn apply_self_update(new_file: &Path) -> bool {
     if is_dry_run() {
-        log("DRY RUN：跳过实际安装。");
-        log(&format!("DRY RUN 安装包：{}", installer.display()));
-        log(&format!("DRY RUN 目标：{}", app_path.display()));
-        log(&format!(
-            "DRY RUN 命令：cmd.exe /c \"{}\"（脚本内容见 {}）",
-            script_path.display(),
-            script_path.display()
-        ));
+        log("DRY RUN：跳过实际更新。");
+        log(&format!("DRY RUN 更新包：{}", new_file.display()));
+        match std::env::current_exe() {
+            Ok(target) => log(&format!("DRY RUN 目标：{}", target.display())),
+            Err(error) => log(&format!("DRY RUN 目标：读取当前程序路径失败（{error}）")),
+        }
         return true;
     }
 
-    let result = std::process::Command::new("cmd.exe")
-        .raw_arg(format!("/c \"\"{}\"\"", script_path.display()))
-        .env("NC_SETUP", installer)
-        .env("NC_APP", &app_path)
-        .env("NC_LOG", &install_log)
-        .current_dir(&directory)
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .spawn();
+    if !new_file.exists() {
+        log(&format!(
+            "启动自更新失败：更新包不存在（{}）。",
+            new_file.display()
+        ));
+        return false;
+    }
 
-    match result {
-        Ok(_) => {
-            log(&format!("已启动静默安装：{}", installer.display()));
+    let target = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            log(&format!(
+                "启动自更新失败：读取当前程序路径失败（{error}）。"
+            ));
+            return false;
+        }
+    };
+
+    match crate::selfupdate::spawn_helper(&target, new_file) {
+        Ok(()) => {
+            log(&format!("已启动自更新：{}", new_file.display()));
             true
         }
         Err(error) => {
-            log(&format!("启动静默安装失败：{error}"));
+            log(&format!("启动自更新失败：{error}"));
             false
         }
     }
@@ -511,8 +409,8 @@ pub fn log(message: &str) {
 pub struct UpdateService;
 
 impl UpdateService {
-    pub fn installer_path(version: &str) -> PathBuf {
-        installer_path(version)
+    pub fn payload_path(version: &str) -> PathBuf {
+        payload_path(version)
     }
 
     pub fn is_dry_run() -> bool {
@@ -535,8 +433,8 @@ impl UpdateService {
         download(manifest, destination)
     }
 
-    pub fn launch_installer_silently(installer: &Path) -> bool {
-        launch_installer_silently(installer)
+    pub fn apply_self_update(new_file: &Path) -> bool {
+        apply_self_update(new_file)
     }
 
     pub fn cleanup_old_files() {
@@ -555,7 +453,7 @@ mod tests {
     fn sample_manifest() -> String {
         let sha = "a".repeat(64);
         format!(
-            "{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"notes\":\"test\",\"installer\":{{\"url\":\"https://example.com/NetConditioner-9.9.9-win-x64-Setup.exe\",\"sha256\":\"{sha}\",\"size\":123}}}}"
+            "{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"notes\":\"test\",\"installer\":{{\"url\":\"https://example.com/NetConditioner-9.9.9-win-x64.exe\",\"sha256\":\"{sha}\",\"size\":123}}}}"
         )
     }
 
@@ -572,10 +470,10 @@ mod tests {
     fn rejects_invalid_manifests() {
         let sha = "a".repeat(64);
         let invalid = [
-            format!("{{\"schemaVersion\":1,\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\"}}}}"),
-            format!("{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"abc\"}}}}"),
-            format!("{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"http://example.com/a.exe\",\"sha256\":\"{sha}\"}}}}"),
-            format!("{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\"}}}}"),
+            format!("{{\"schemaVersion\":2,\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\"}}}}"),
+            format!("{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"abc\"}}}}"),
+            format!("{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"http://example.com/a.exe\",\"sha256\":\"{sha}\"}}}}"),
+            format!("{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\"}}}}"),
             "not json".to_string(),
         ];
         for manifest in invalid {
@@ -587,18 +485,18 @@ mod tests {
     fn rejects_out_of_range_fields() {
         let sha = "a".repeat(64);
         let negative_size = format!(
-            "{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\",\"size\":-1}}}}"
+            "{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\",\"size\":-1}}}}"
         );
         assert!(try_parse_manifest(&negative_size).is_err());
 
         let huge_size = format!(
-            "{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\",\"size\":{}}}}}",
+            "{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\",\"size\":{}}}}}",
             MAX_INSTALLER_BYTES + 1
         );
         assert!(try_parse_manifest(&huge_size).is_err());
 
         let long_notes = format!(
-            "{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"notes\":\"{}\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\"}}}}",
+            "{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"notes\":\"{}\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sha}\"}}}}",
             "x".repeat(4001)
         );
         assert!(try_parse_manifest(&long_notes).is_err());

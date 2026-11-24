@@ -1,12 +1,14 @@
 //! WinDivert 2.2.x 动态加载与薄 FFI 封装（对应原 `WinDivertNative.cs`）。
 //!
-//! 用 `LoadLibraryW` + `GetProcAddress` 加载随程序附带的 `WinDivert.dll`，
-//! 因此不需要 import lib，也能给出与旧版本一致的错误提示。
+//! 单文件分发：DLL 与驱动编进 exe，首次使用时解压到运行时目录，
+//! 再用 `LoadLibraryExW(LOAD_WITH_ALTERED_SEARCH_PATH)` 从该目录加载，
+//! 保证 WinDivert 能在 DLL 同目录找到 WinDivert64.sys。
 
 use std::ffi::{c_void, CString};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW};
 
 pub const LAYER_NETWORK: i32 = 0;
 
@@ -60,6 +62,101 @@ unsafe impl Sync for Api {}
 
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
 
+const WINDIVERT_DLL_BYTES: &[u8] = include_bytes!("../../third_party/WinDivert/WinDivert.dll");
+const WINDIVERT_SYS_BYTES: &[u8] = include_bytes!("../../third_party/WinDivert/WinDivert64.sys");
+static WINDIVERT_VERSION: &str = include_str!("../../third_party/WinDivert/VERSION");
+const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
+
+/// 随程序分发的 WinDivert 版本（运行时目录按版本区分）。
+pub fn payload_version() -> &'static str {
+    WINDIVERT_VERSION.trim()
+}
+
+fn to_wide(text: &str) -> Vec<u16> {
+    text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 优先用管理员独占可写的 Program Files，其次 ProgramData / LocalAppData。
+fn runtime_candidates() -> Vec<PathBuf> {
+    let version = payload_version();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for variable in ["ProgramFiles", "ProgramData", "LOCALAPPDATA"] {
+        if let Some(value) = std::env::var_os(variable) {
+            let root = PathBuf::from(value)
+                .join("NetConditioner")
+                .join("runtime")
+                .join(version);
+            if !candidates.contains(&root) {
+                candidates.push(root);
+            }
+        }
+    }
+    candidates
+}
+
+fn ensure_payload_dir(directory: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("创建目录失败（{}）：{error}", directory.display()))?;
+
+    let dll_path = directory.join("WinDivert.dll");
+    write_if_needed(&dll_path, WINDIVERT_DLL_BYTES)?;
+    write_if_needed(&directory.join("WinDivert64.sys"), WINDIVERT_SYS_BYTES)?;
+    Ok(dll_path)
+}
+
+fn write_if_needed(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Ok(existing) = std::fs::read(path) {
+        if existing == bytes {
+            return Ok(());
+        }
+    }
+
+    let mut temp = path.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    std::fs::write(&temp, bytes)
+        .map_err(|error| format!("写入 {} 失败：{error}", temp.display()))?;
+    if let Err(error) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(format!("替换 {} 失败：{error}", path.display()));
+    }
+    Ok(())
+}
+
+/// 返回已就绪的 WinDivert.dll 路径；必要时把内嵌运行时解压到磁盘。
+pub fn resolve_dll_path() -> Result<PathBuf, String> {
+    let mut last_error = String::from("没有可用的运行时目录。");
+    for directory in runtime_candidates() {
+        match ensure_payload_dir(&directory) {
+            Ok(dll_path) => {
+                cleanup_old_versions(&directory);
+                return Ok(dll_path);
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(format!("无法准备 WinDivert 运行时：{last_error}"))
+}
+
+fn cleanup_old_versions(current_dll: &Path) {
+    let Some(current_dir) = current_dll.parent() else {
+        return;
+    };
+    let Some(root) = current_dir.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == current_dir || !path.is_dir() {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(path);
+    }
+}
+
 fn symbol<T: Copy>(module: *mut c_void, name: &str) -> Result<T, String> {
     let cname = CString::new(name).map_err(|_| format!("非法导出名：{name}"))?;
     let proc = unsafe { GetProcAddress(module, cname.as_ptr() as *const u8) };
@@ -75,13 +172,20 @@ fn symbol<T: Copy>(module: *mut c_void, name: &str) -> Result<T, String> {
 }
 
 fn load() -> Result<Api, String> {
-    let mut module_name: Vec<u16> = "WinDivert.dll".encode_utf16().collect();
-    module_name.push(0);
-    let module = unsafe { LoadLibraryW(module_name.as_ptr()) };
+    let dll_path = resolve_dll_path()?;
+    let wide_path = to_wide(&dll_path.to_string_lossy());
+    let module = unsafe {
+        LoadLibraryExW(
+            wide_path.as_ptr(),
+            std::ptr::null_mut(),
+            LOAD_WITH_ALTERED_SEARCH_PATH,
+        )
+    };
     if module.is_null() {
         let error = std::io::Error::last_os_error();
         return Err(format!(
-            "找不到 WinDivert.dll。请确认 WinDivert.dll 和 WinDivert64.sys 与程序在同一目录。（{error}）"
+            "无法加载 WinDivert.dll（{}）：{error}",
+            dll_path.display()
         ));
     }
 
@@ -104,8 +208,10 @@ fn api() -> Result<&'static Api, String> {
 
 pub fn describe_open_error(code: i32) -> String {
     match code {
-        2 => "找不到 WinDivert64.sys。请确认 WinDivert.dll 和 WinDivert64.sys 与程序在同一目录。"
-            .to_string(),
+        2 => {
+            "找不到 WinDivert64.sys。运行时文件可能不完整，请删除 %ProgramFiles%\\NetConditioner\\runtime 后重试。"
+                .to_string()
+        }
         5 => "拒绝访问。WinDivert 需要管理员权限，请以管理员身份运行。".to_string(),
         577 => {
             "WinDivert 驱动签名无效或被系统拦截。请使用随程序附带的官方 2.2.2 文件，并检查杀毒软件。"
@@ -225,5 +331,43 @@ pub fn parse_protocol(packet: *const u8, length: u32) -> Option<u8> {
         None
     } else {
         Some(protocol)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_payload_matches_files() {
+        assert_eq!(
+            WINDIVERT_DLL_BYTES,
+            std::fs::read("third_party/WinDivert/WinDivert.dll").expect("dll")
+        );
+        assert_eq!(
+            WINDIVERT_SYS_BYTES,
+            std::fs::read("third_party/WinDivert/WinDivert64.sys").expect("sys")
+        );
+        assert_eq!(payload_version(), "2.2.2");
+    }
+
+    #[test]
+    fn extracts_payload_to_directory() {
+        let directory =
+            std::env::temp_dir().join(format!("nc-windivert-runtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+
+        let dll_path = ensure_payload_dir(&directory).expect("extract");
+        assert_eq!(std::fs::read(&dll_path).expect("dll"), WINDIVERT_DLL_BYTES);
+        assert_eq!(
+            std::fs::read(directory.join("WinDivert64.sys")).expect("sys"),
+            WINDIVERT_SYS_BYTES
+        );
+
+        // 第二次调用应复用已就绪的文件。
+        assert!(ensure_payload_dir(&directory).is_ok());
+        assert_eq!(std::fs::read(&dll_path).expect("dll"), WINDIVERT_DLL_BYTES);
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

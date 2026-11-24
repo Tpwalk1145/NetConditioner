@@ -143,14 +143,14 @@ pub fn run() -> i32 {
     // 云更新：latest.json 校验规则。
     let sample_sha = "a".repeat(64);
     let valid_manifest = format!(
-        "{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"notes\":\"test\",\"installer\":{{\"url\":\"https://example.com/NetConditioner-9.9.9-win-x64-Setup.exe\",\"sha256\":\"{sample_sha}\",\"size\":123}}}}"
+        "{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"notes\":\"test\",\"installer\":{{\"url\":\"https://example.com/NetConditioner-9.9.9-win-x64.exe\",\"sha256\":\"{sample_sha}\",\"size\":123}}}}"
     );
     let parsed_manifest = UpdateService::try_parse_manifest(&valid_manifest);
     let invalid_manifests = [
-        format!("{{\"schemaVersion\":1,\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
-        format!("{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"abc\"}}}}"),
-        format!("{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"http://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
-        format!("{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
+        format!("{{\"schemaVersion\":2,\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
+        format!("{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"abc\"}}}}"),
+        format!("{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"http://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
+        format!("{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
         "not json".to_string(),
     ];
     let mut invalid_rejected = true;
@@ -224,7 +224,7 @@ pub fn run() -> i32 {
     routes.insert(
         "/latest.json".to_string(),
         format!(
-            "{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"http://127.0.0.1:{update_port}/payload.bin\",\"sha256\":\"{update_payload_sha}\",\"size\":{}}}}}",
+            "{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"http://127.0.0.1:{update_port}/payload.bin\",\"sha256\":\"{update_payload_sha}\",\"size\":{}}}}}",
             update_payload.len()
         )
         .into_bytes(),
@@ -255,9 +255,9 @@ pub fn run() -> i32 {
                         .map(|bytes| UpdateService::compute_sha256_hex(&bytes))
                         .unwrap_or_default();
                     if downloaded && downloaded_sha == update_payload_sha {
-                        log.pass("云更新：安装包下载 + SHA256 校验通过");
+                        log.pass("云更新：更新包下载 + SHA256 校验通过");
                     } else {
-                        log.fail("云更新：安装包下载或 SHA256 校验失败。");
+                        log.fail("云更新：更新包下载或 SHA256 校验失败。");
                     }
                     let _ = std::fs::remove_file(&destination);
 
@@ -270,7 +270,7 @@ pub fn run() -> i32 {
                     let tampered_downloaded =
                         UpdateService::download(&tampered, &tampered_destination);
                     if !tampered_downloaded && !tampered_destination.exists() {
-                        log.pass("云更新：SHA256 不匹配时拒绝安装包");
+                        log.pass("云更新：SHA256 不匹配时拒绝更新包");
                     } else {
                         log.fail("云更新：SHA256 不匹配未被拒绝。");
                         let _ = std::fs::remove_file(&tampered_destination);
@@ -282,20 +282,20 @@ pub fn run() -> i32 {
         None => log.skip("云更新：本地回环测试服务无法启动。"),
     }
 
-    // 云更新：静默安装命令（dry-run，只记录不执行）。
+    // 云更新：自更新命令（dry-run，只记录不执行）。
     {
-        let dummy_installer = std::env::temp_dir().join("NetConditioner-selftest-dummy-setup.exe");
-        let _ = std::fs::write(&dummy_installer, b"dummy-installer");
+        let dummy_payload = std::env::temp_dir().join("NetConditioner-selftest-dummy-update.exe");
+        let _ = std::fs::write(&dummy_payload, b"dummy-update");
         std::env::set_var("NC_UPDATE_DRY_RUN", "1");
-        let launched = UpdateService::launch_installer_silently(&dummy_installer);
+        let applied = UpdateService::apply_self_update(&dummy_payload);
         std::env::remove_var("NC_UPDATE_DRY_RUN");
-        let script_path = crate::update::update_directory().join("apply-update.cmd");
-        if launched && script_path.exists() {
-            log.pass("云更新：静默安装 dry-run 命令生成正确");
+        let log_text = std::fs::read_to_string(crate::update::log_path()).unwrap_or_default();
+        if applied && log_text.contains("DRY RUN 更新包") {
+            log.pass("云更新：自更新 dry-run 命令生成正确");
         } else {
-            log.fail("云更新：静默安装 dry-run 命令生成失败。");
+            log.fail("云更新：自更新 dry-run 命令生成失败。");
         }
-        let _ = std::fs::remove_file(&dummy_installer);
+        let _ = std::fs::remove_file(&dummy_payload);
     }
 
     let port = find_free_tcp_port(LOOPBACK);

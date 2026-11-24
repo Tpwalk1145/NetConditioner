@@ -1,11 +1,12 @@
-# NetConditioner 弱网模拟器（Rust 版）
+# NetConditioner 弱网模拟器（Rust 单文件版）
 
 Windows 系统级弱网模拟工具：通过全局热键一键开启/停止上行、下行的延时、抖动、带宽、随机丢包和连续丢包。界面参考弱网测试 App 的配置方式，做成“VPN 客户端”的连接/断开形式，但底层使用 **WinDivert 2.2.2** 在网络层拦截并重注入 TCP/UDP，不需要 TUN/TAP 虚拟网卡，也不会修改系统路由、DNS 或防火墙。
 
-本仓库是 2.0.0 的 **Rust 重写版**：原生 Win32 界面（无第三方 UI 框架）、单文件原生 exe、无需 .NET 运行时。配置文件、安装标识（Inno AppId）、单实例互斥体、云更新清单与日志路径都与 1.x 保持一致，可以原位升级。
+本仓库是 2.1.0 的 **Rust 单文件版**：只有一个 exe，内置 WinDivert 运行时，不需要安装包、不需要 .NET 运行时；首次运行会把内置的 WinDivert.dll / WinDivert64.sys 解压到本机运行时目录（约 140 KB），之后直接复用。
 
 ## 功能
 
+- 单文件分发：整个程序就是一个 NetConditioner.exe，拷贝到任意目录双击即可运行
 - 上行 / 下行独立配置：
   - 延时（ms）
   - 延时抖动（ms）
@@ -20,7 +21,7 @@ Windows 系统级弱网模拟工具：通过全局热键一键开启/停止上�
 - 小窗口 + 系统托盘 + 自定义全局热键（默认 Ctrl + Alt + U；也支持单键，如 F8）
   - 单键会全局占用该按键，例如把字母 A 设为热键后，正常打字也会触发；建议优先用 F1–F12 等不常用键。
 - 实时统计：上下行发送、丢弃、队列长度
-- 云更新：配置更新地址后，后台静默检查新版本并自动升级（不弹窗，升级时窗口闪一下重启）
+- 云更新：配置更新地址后，后台静默检查、下载新 exe 并自替换重启（不弹窗，升级时窗口闪一下）
 - 最长运行时间保护：到时自动停止并恢复网络
 - 最大额外排队时延保护：避免突发流量把队列堆到几分钟，造成严重卡顿
 - 配置与目标进程设置保存在 %AppData%\NetConditioner\config.json
@@ -39,28 +40,25 @@ Windows 系统级弱网模拟工具：通过全局热键一键开启/停止上�
 
 - Windows 10 / 11 x64
 - 管理员权限（WinDivert 驱动需要）
-- 运行程序：**不需要 .NET 运行时**，只需要下面三个文件（约 2.1 MB）：
-  - NetConditioner.exe
-  - WinDivert.dll
-  - WinDivert64.sys
+- 运行程序：**不需要安装任何东西**，只需一个 NetConditioner.exe；首次运行会解压约 140 KB 的 WinDivert 运行时
 - 构建程序：
   - Rust（MSVC 工具链，x86_64-pc-windows-msvc；本项目在 rustc 1.102 上开发验证）
   - Visual Studio 2022 Build Tools（“使用 C++ 的桌面开发”）+ Windows SDK（需要其中的 rc.exe 来嵌入版本信息与 manifest）
-  - 打包安装包另需 Inno Setup 6
-- 随程序附带的 WinDivert.dll / WinDivert64.sys（2.2.2 官方版本）
+  - 单文件版不再需要 Inno Setup
+- 随程序分发的 WinDivert 运行时（2.2.2 官方 DLL/驱动）已编进 exe
 
 ## 构建与运行
 
-一键构建（编译 + 单元测试 + 发布 + 打包安装包）：
+一键构建（编译 + 单元测试 + 生成单文件 exe 与更新清单）：
 
     cd NetConditioner
     .\build.ps1
 
 也可以直接双击根目录的 build.cmd（等价于执行 build.ps1）。
 
-只编译、不打包（并把 WinDivert 文件放进 target 目录，方便直接运行）：
+只编译（并跑测试），不生成 dist 产物：
 
-    .\build.ps1 -SkipInstaller
+    .\build.ps1 -SkipPackage
 
 跳过测试：
 
@@ -71,87 +69,84 @@ Windows 系统级弱网模拟工具：通过全局热键一键开启/停止上�
     cargo build --release
     cargo test
 
-开发运行：
+开发运行（不需要再手动拷贝 WinDivert 文件）：
 
-    .\build.ps1 -SkipInstaller
+    cargo build --release
     .\target\release\NetConditioner.exe
 
-或者用完整构建产物（已带 WinDivert 文件）：
+构建产物：
 
-    .\publish\win-x64\NetConditioner.exe
+    dist\NetConditioner-2.1.0-win-x64.exe
+    dist\latest.json
 
 实测体积与启动时间（本机 Release 构建）：
 
 | 项目 | 数值 |
 | --- | --- |
-| NetConditioner.exe | 约 1.9 MB |
-| 运行三文件合计 | 约 2.1 MB |
-| 安装包 | 约 2.76 MB |
-| 冷启动到窗口可见 | 约 80 ms |
+| 单文件 exe | 约 2.1 MB |
+| 首次运行解压的 WinDivert 运行时 | 约 140 KB（%ProgramFiles%\NetConditioner\runtime\2.2.2\） |
+| 冷启动到窗口可见 | 约 50–100 ms（本机实测约 60 ms；首次运行含解压校验） |
 
-首次运行会弹出 UAC；程序需要以管理员身份运行。WinDivert.dll 会自动加载同目录的 WinDivert64.sys。
+首次运行会弹出 UAC；程序需要以管理员身份运行。WinDivert.dll 会从运行时目录加载，并在 DLL 同目录找到 WinDivert64.sys 后自动安装/加载驱动。
 
-## 打包安装包
+### 单文件是怎么做到的
 
-使用 Inno Setup 6 制作安装包。程序是原生单文件 exe，目标机器无需安装任何运行时。
+- WinDivert.dll 与 WinDivert64.sys 通过 include_bytes! 编进 exe；
+- 启动时优先解压到 %ProgramFiles%\NetConditioner\runtime\<WinDivert 版本>\（管理员独占可写，避免被普通用户替换），失败则依次回退到 %ProgramData%、%LOCALAPPDATA%；
+- 每次启动都会校验已解压文件与内置内容是否一致，不一致就重写；
+- 加载时使用 LoadLibraryExW(..., LOAD_WITH_ALTERED_SEARCH_PATH)，确保 WinDivert 从该目录加载并在同目录找到驱动；
+- 旧版本运行时目录会被尽力清理。
 
-1. 安装 Inno Setup 6：
+注意：Windows 安装驱动必须有一个真实的 .sys 文件，因此“单 exe”指的是**分发只有一个文件**，运行时仍会落盘约 140 KB；这无法避免。
 
-       winget install JRSoftware.InnoSetup
+## 分发与云更新清单
 
-2. 在仓库根目录执行一键构建脚本（编译 → 测试 → 发布 → 打包）：
+单文件版不需要安装包，分发只需要：
 
-       .\build.ps1
-
-   也可以直接双击根目录的 build.cmd。脚本会先 cargo build / cargo test，再把 exe 与 WinDivert 文件暂存到 publish\win-x64，最后调用 ISCC.exe 生成：
-
-       dist\NetConditioner-2.0.0-win-x64-Setup.exe
-
-3. 双击安装包安装；会创建开始菜单快捷方式和卸载项，默认安装到 C:\Program Files\NetConditioner。程序按嵌入的 app.manifest 请求管理员权限。
+1. dist\NetConditioner-<版本>-win-x64.exe
+2. dist\latest.json（如果启用云更新）
 
 build.ps1 常用参数：
 
 | 参数 | 说明 |
 | --- | --- |
-| -Version 2.0.1 | 指定安装包版本（默认取 Cargo.toml 的 version）；exe 内嵌版本始终来自 Cargo.toml，不一致时会警告 |
-| -UpdateBaseUrl <url> | 云更新地址前缀；生成 dist\latest.json 时用作安装包 URL（默认占位地址，上传前需替换） |
+| -Version 2.1.1 | 指定产物文件名与 latest.json 版本（默认取 Cargo.toml 的 version）；exe 内嵌版本始终来自 Cargo.toml，不一致时会警告 |
+| -UpdateBaseUrl <url> | 云更新地址前缀；生成 latest.json 时用作更新包 URL（默认占位地址，上传前需替换） |
 | -Notes <文本> | 写进 latest.json 的更新说明 |
-| -Clean | 先删除 target / publish / dist 再构建 |
+| -Clean | 先删除 target / dist 再构建 |
 | -SkipTests | 不运行 cargo test |
-| -SkipInstaller | 只编译（并把 WinDivert 文件放进 target），不发布、不打包 |
-| -SkipPublish | 复用现有 publish\win-x64 目录，只重新生成安装包 |
+| -SkipPackage | 只编译（并跑测试），不生成 dist 产物 |
 | -Configuration Debug | 指定构建配置（默认 Release） |
-| -ISCCPath <路径> | 手动指定 ISCC.exe |
 
-说明：
+生成的 latest.json（schemaVersion 2，installer 字段指向单文件 exe）：
 
-- 安装包约 2.76 MB：原生 exe 约 1.9 MB，再经 LZMA2 压缩。
-- ISCC.exe 不在 PATH 时，可用 -ISCCPath 指定，或设置 INNO_SETUP_HOME 环境变量；未安装 Inno Setup 时脚本会直接报错提示。
-- 根目录 build.ps1 是入口，实际的发布 + ISCC 编译逻辑在 installer\build-installer.ps1，也可以单独调用它。
-- 构建完成后会同时生成 dist\latest.json（云更新清单），把它和安装包一起上传即可。
-- 配置仍保存在 %AppData%\NetConditioner\config.json，卸载不会删除。
+    {
+      "schemaVersion": 2,
+      "version": "2.1.1",
+      "publishedAt": "2026-11-24T00:00:00Z",
+      "notes": "修复若干问题",
+      "pageUrl": "https://你的域名/NetConditioner/",
+      "installer": {
+        "url": "https://你的域名/NetConditioner/NetConditioner-2.1.1-win-x64.exe",
+        "sha256": "D9C7F19E...",
+        "size": 2215424
+      }
+    }
 
-### Rust 构建细节
+把 exe 和 latest.json 上传到同一目录即可。任意静态托管（对象存储、Nginx、GitHub Releases）都可以；用 GitHub Releases 时可以用固定地址 https://github.com/<用户>/<仓库>/releases/latest/download/latest.json。
 
-- 单 crate、单二进制；build.rs 生成并嵌入 VERSIONINFO（版本来自 Cargo.toml）与 app.manifest（requireAdministrator + Windows 10/11 supportedOS）。缺少 rc.exe 时构建会给出明确报错。
-- Release 配置开启 thin LTO、单 codegen unit、剥离符号。
-- 界面不依赖 gtk/egui 等框架：用 windows-sys 直接创建窗口与控件，GDI 自绘按钮/卡片，支持 Per-Monitor V2 DPI。
-- WinDivert 通过 LoadLibraryW 动态加载随包的 DLL，不静态链接，也不依赖 .NET 的 P/Invoke。
-- 云更新使用 ureq + native-tls（Windows 上即 SChannel，走系统证书库）。
-- 引擎沿用 1.x 的设计：每方向“接收线程 + 发送线程”、到期时间优先队列、统计原子计数；对象池复用包缓冲。
-- 单元测试：cargo test（配置兼容与清洗、版本比较、更新清单校验、SHA256、包首部解析、连续丢包状态机、进程匹配、坏配置恢复）。
+## 云更新（静默自替换）
 
-## 云更新（静默自动升级）
-
-配置更新地址后，程序会在后台**完全静默**地检查、下载、校验并安装新版本：没有弹窗、没有托盘气泡、没有安装向导，唯一可见的现象是升级时窗口闪一下后重新出现。
+配置更新地址后，程序会在后台**完全静默**地检查、下载、校验并替换自身：没有弹窗、没有托盘气泡、没有安装向导，唯一可见的现象是升级时窗口闪一下后重新出现。
 
 ### 行为
 
 - 启动约 5 秒后检查一次，之后每 6 小时检查一次；**每天最多检查一次**（距上次检查不足 24 小时则跳过）。
 - 发现新版本后自动下载到 %TEMP%\NetConditioner\update\，边下边算 SHA256；校验失败会删除文件，并在 24 小时内不再尝试同一版本。
-- 只有“空闲”时才安装：弱网未运行、没有正在切换、没有打开设置/编辑等对话框。弱网运行中只等待，不打断；停止弱网或隐藏到托盘后会继续静默安装。
-- 安装时用 /VERYSILENT 静默运行安装包，安装完成后自动重新启动程序。
+- 只有“空闲”时才替换：弱网未运行、没有正在切换、没有打开设置/编辑等对话框。弱网运行中只等待，不打断；停止弱网或隐藏到托盘后会继续。
+- 替换方式：把当前 exe 复制成更新助手，助手等旧进程退出后用新 exe 覆盖原路径并重新启动；新文件会去掉 Mark-of-the-Web，避免被 SmartScreen 拦。
 - 所有失败只写入 %TEMP%\NetConditioner\update\update.log，不打扰用户。
+- exe 所在目录必须可写（不要放在只读目录/光盘）；只读时替换失败会保留当前版本并写日志。
 
 ### 配置
 
@@ -164,38 +159,27 @@ build.ps1 常用参数：
 
 仅支持 https；本机回环地址（http://127.0.0.1:...）允许 http，便于本地联调。
 
-### 生成更新清单
-
-    .\build.ps1 -UpdateBaseUrl https://你的域名/NetConditioner -Notes "修复若干问题"
-
-会在 dist\ 生成 latest.json，内容形如：
-
-    {
-      "schemaVersion": 1,
-      "version": "2.0.1",
-      "publishedAt": "2026-11-24T00:00:00Z",
-      "notes": "修复若干问题",
-      "pageUrl": "https://你的域名/NetConditioner/",
-      "installer": {
-        "url": "https://你的域名/NetConditioner/NetConditioner-2.0.1-win-x64-Setup.exe",
-        "sha256": "D9C7F19E...",
-        "size": 7123456
-      }
-    }
-
-把 latest.json 和对应的安装包上传到同一目录即可。任意静态托管（对象存储、Nginx、GitHub Releases）都可以；用 GitHub Releases 时可以用固定地址 https://github.com/<用户>/<仓库>/releases/latest/download/latest.json，把 latest.json 作为 release 资产上传。
-
 ### 诊断
 
     # 按当前配置检查一次，结果写到 %TEMP%\NetConditioner-update-check.log（不弹任何界面）
     NetConditioner.exe --check-update
 
-    # 开发者联调：只记录安装命令，不真正运行安装包
+    # 开发者联调：只记录更新命令，不真正替换/重启
     $env:NC_UPDATE_DRY_RUN = "1"
+
+    # 导出 WinDivert 许可文本到 %TEMP%\NetConditioner\licenses\WinDivert-LICENSE.txt
+    NetConditioner.exe --licenses
 
 ### 安全边界
 
 自动更新没有用户确认环节，因此依赖：**https 传输 + latest.json 中的 SHA256 完整性校验 + 更新源可信**。请只把更新地址指向自己控制的服务器；项目未做代码签名。
+
+latest.json 的 schemaVersion 为 2。旧版（安装包版，schemaVersion 1）会拒绝该清单，不会把新 exe 误当成安装程序执行。
+
+## 从旧版迁移
+
+- 如果之前装过 1.x / 2.0.0 的安装包版本：先卸载旧版（旧安装包仍在“应用和功能”里），再用单文件 exe；配置、目标进程、热键、更新设置都保留在 %AppData%\NetConditioner\config.json。
+- 旧安装版不会自动升级到单文件版（更新清单版本号不同），需要手动替换一次。
 
 ## 使用
 
@@ -267,7 +251,7 @@ build.ps1 常用参数：
 
 ## 配置文件兼容性
 
-config.json 与 1.x 完全兼容：camelCase 属性名、协议枚举写成字符串（Tcp / Udp / All）、字段缺失或为 null 时回退默认值。升级到 Rust 版后原有配置、目标进程、热键、更新设置都会保留；Rust 版写出的配置也能被 1.1.0 的 .NET 版正常读取（已实测双向读取）。
+config.json 与 1.x/2.0.0 完全兼容：camelCase 属性名、协议枚举写成字符串（Tcp / Udp / All）、字段缺失或为 null 时回退默认值。升级到单文件版后原有配置、目标进程、热键、更新设置都会保留；Rust 版与旧 .NET 版写出的配置可互相读取（已实测双向读取）。
 
 ## 安全与恢复
 
@@ -276,27 +260,31 @@ config.json 与 1.x 完全兼容：camelCase 属性名、协议枚举写成字�
 - 不修改系统路由、DNS、代理、防火墙或网卡配置。
 - WinDivert 驱动会由 DLL 自动安装/加载；驱动服务本身会保留在系统中，这是 WinDivert 的正常行为。
 - 如果远程桌面中设置了高丢包/低带宽，可能断开连接。请先在“设置”里设置“最长运行时间”，让程序到时自动恢复。
+- 单文件版会在 %ProgramFiles%\NetConditioner\runtime\ 留下约 140 KB 的运行时文件；删除 exe 后如需彻底清理，可一并删除该目录和 %AppData%\NetConditioner（配置）。
 
 ## 故障排查
 
 | 现象 | 处理 |
 | --- | --- |
-| 启动失败，错误 2 | WinDivert.dll / WinDivert64.sys 不在 exe 同目录 |
+| 启动失败，错误 2 | WinDivert 运行时文件不完整；删除 %ProgramFiles%\NetConditioner\runtime 后重试 |
+| 提示“无法准备 WinDivert 运行时” | 程序无法写入 Program Files / ProgramData / AppData；请以管理员身份运行或检查磁盘权限 |
 | 启动失败，错误 5 | 没有以管理员身份运行 |
 | 启动失败，错误 577 / 1275 | 驱动签名被拦截或安全软件阻止；检查杀毒软件，使用随包的 2.2.2 官方文件 |
 | 提示已有不兼容的 WinDivert 驱动 | 本机其它程序可能加载了不同版本的 WinDivert；退出该程序或重启后再试 |
+| 被杀软误报 | 单文件版会在运行时释放签名驱动并加载，部分安全软件会敏感；可加入白名单或改用旧安装版 |
 | 热键没反应 | 热键被其它程序占用，打开“设置”换一个组合 |
 | 选了目标进程但没效果 | 确认进程名与任务管理器一致；新启动的程序最多约 2 秒后生效；系统驱动级流量可能没有 TCP/UDP 记录 |
 | 启动后立即恢复 | 检查 Windows 事件查看器/杀毒软件；可运行 NetConditioner.exe --self-test 查看日志 |
 | 云更新没生效 | 看 %TEMP%\NetConditioner\update\update.log；确认“设置 → 软件更新”里已填 https 地址并勾选自动静默更新 |
-| 更新后程序没重新打开 | 手工启动程序；安装日志在 %TEMP%\NetConditioner\update\install-*.log |
+| 更新后程序没重新打开 | 手工启动程序；更新日志在 %TEMP%\NetConditioner\update\update.log |
+| 更新失败提示无法替换 | exe 所在目录不可写（如在只读共享/受保护目录）；把 exe 放到用户可写目录 |
 | 构建报错找不到 rc.exe | 安装 Visual Studio 2022 Build Tools（C++ 桌面开发）与 Windows SDK，或在 “Developer PowerShell” 里执行构建 |
 
 自测：
 
     NetConditioner.exe --self-test
 
-覆盖上下行延时、64kbps 限速、100% 丢包、停止恢复、进程过滤（IPv4/IPv6 TCP、UDP；命中生效 / 未命中直通）、64KB/1MB 突发无额外丢包、真实网卡 80 端口的上下行方向验证，以及云更新（版本比较、latest.json 校验、配置清洗、本地回环 HTTP 下载与 SHA256 校验/篡改拒绝、静默安装命令 dry-run）。结果写入 %TEMP%\NetConditioner-selftest.log。自测只影响本机回环测试端口和公网 80 端口，不会影响 443 连接。Release 版同样支持 --self-test（已实测全项通过）。
+覆盖上下行延时、64kbps 限速、100% 丢包、停止恢复、进程过滤（IPv4/IPv6 TCP、UDP；命中生效 / 未命中直通）、64KB/1MB 突发无额外丢包、真实网卡 80 端口的上下行方向验证，以及云更新（版本比较、latest.json 校验、配置清洗、本地回环 HTTP 下载与 SHA256 校验/篡改拒绝、自更新 dry-run）。结果写入 %TEMP%\NetConditioner-selftest.log。自测只影响本机回环测试端口和公网 80 端口，不会影响 443 连接。Release 版同样支持 --self-test（已实测全项通过）。
 
 ## 与 TUN/TAP、VPN 的关系
 
@@ -308,21 +296,23 @@ config.json 与 1.x 完全兼容：camelCase 属性名、协议枚举写成字�
       Cargo.toml                  # 包信息、依赖、Release 优化配置
       build.rs                    # 生成并嵌入 VERSIONINFO 与 app.manifest
       app.manifest                # requireAdministrator + Win10/11 supportedOS
-      build.ps1 / build.cmd       # 一键构建（编译 + 测试 + 发布 + 打包安装包）
+      build.ps1 / build.cmd       # 一键构建（编译 + 测试 + 单文件产物 + latest.json）
       src/
         main.rs                   # 入口、参数、单实例、管理员校验、DPI、消息泵
         app.rs                    # 应用状态、主窗口消息处理、启停/配置/更新流程
         win.rs                    # Win32 薄封装（窗口、消息、GDI、字体、托盘基础）
         config/                   # 配置模型、清洗规则、原子读写
-        engine/                   # WinDivert 绑定、包解析、进程过滤、方向引擎
+        engine/                   # WinDivert 内嵌运行时/绑定、包解析、进程过滤、方向引擎
         ui/                       # 主窗口、配置编辑、设置、进程选择、托盘、自绘控件
-        update/                   # 云更新（检查/下载/校验/静默安装/状态机）
+        update/                   # 云更新（检查/下载/校验/自替换/状态机）
+        selfupdate.rs             # 自更新助手（等旧进程退出后替换 exe 并重启）
+        licenses.rs               # 导出 WinDivert 许可文本
         hotkey.rs version.rs neturl.rs selftest.rs checkupdate.rs
-      installer/                  # Inno Setup 脚本、中文语言文件、打包脚本
-      third_party/WinDivert/      # WinDivert 2.2.2 DLL/SYS、LICENSE、VERSION
+      third_party/WinDivert/      # WinDivert 2.2.2 DLL/SYS、LICENSE、VERSION（编进 exe）
       README.md
 
 ## 许可
 
-WinDivert 由 Basil（reqrypt.org）开发，采用 LGPLv3 / GPLv2 双许可。本项目动态链接未修改的 WinDivert DLL/驱动，许可全文见 third_party/WinDivert/LICENSE。WinDivert 源码：https://github.com/basil00/WinDivert。
+WinDivert 由 Basil（reqrypt.org）开发，采用 LGPLv3 / GPLv2 双许可。本项目动态加载未修改的 WinDivert DLL/驱动（单文件版把它们内嵌并在运行时解压加载），许可全文见 third_party/WinDivert/LICENSE，也可以运行 NetConditioner.exe --licenses 导出。
 
+WinDivert 源码：https://github.com/basil00/WinDivert
