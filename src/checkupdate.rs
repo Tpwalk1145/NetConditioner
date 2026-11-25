@@ -1,4 +1,4 @@
-//! --check-update 诊断命令（对应原 UpdateService.RunCheckCommand）。
+//! --check-update 诊断命令。
 
 use std::io::Write;
 

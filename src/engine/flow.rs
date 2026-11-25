@@ -1,4 +1,4 @@
-//! 从 WinDivert 包缓冲区读取协议与本地端点（对应原 `PacketFlowReader`）。
+//! 从 WinDivert 包缓冲区读取协议与本地端点。
 
 /// 本地端点：地址族（4/6）、地址和大端序数值、主机字节序端口。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

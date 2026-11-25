@@ -427,7 +427,7 @@ pub fn last_error_code() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-/// 居中到父窗口（WinForms 的 CenterParent）。*/
+/// 居中到父窗口。
 pub fn center_on_owner(hwnd: HWND, owner: HWND) {
     if owner.is_null() {
         center_on_screen(hwnd);

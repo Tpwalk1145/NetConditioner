@@ -1,7 +1,7 @@
 @echo off
 setlocal
 
-rem NetConditioner one-key build wrapper: build.ps1 (build + package installer).
+rem NetConditioner one-key build wrapper: build.ps1 (build + single-file exe + latest.json).
 rem Usage: build.cmd [build.ps1 arguments]
 
 set "PS=powershell.exe"

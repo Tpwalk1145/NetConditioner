@@ -1,4 +1,4 @@
-//! 配置编辑对话框（对应原 ProfileEditorForm）。
+//! 配置编辑对话框。
 
 use std::collections::HashSet;
 

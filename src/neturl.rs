@@ -1,4 +1,4 @@
-//! 更新地址与哈希的校验（对应原 `UpdateService.TryValidateFeedUrl` / `TryNormalizeSha256`）。
+//! 更新地址与哈希的校验。
 
 /// 更新地址必须是 https；本机回环地址允许 http，便于离线联调。
 pub fn try_validate_feed_url(url: &str) -> Result<(), String> {
@@ -27,7 +27,7 @@ pub fn try_validate_feed_url(url: &str) -> Result<(), String> {
     Err("更新地址必须使用 https（本机回环地址可用 http 调试）。".to_string())
 }
 
-/// 与 .NET `Uri.IsLoopback` 对齐：localhost、127.0.0.0/8、::1。
+/// 本机回环地址：localhost、127.0.0.0/8、::1。
 pub fn is_loopback(url: &url::Url) -> bool {
     let host = match url.host_str() {
         Some(host) => host.trim_matches(['[', ']']),

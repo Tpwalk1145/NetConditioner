@@ -1,4 +1,4 @@
-//! WinDivert 许可文本导出（单文件分发时满足 LGPL 的许可告知要求）。
+//! WinDivert 许可文本导出。
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONINFORMATION, MB_OK};
 

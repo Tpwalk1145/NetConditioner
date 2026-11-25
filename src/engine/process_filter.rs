@@ -1,4 +1,4 @@
-//! 根据系统 TCP/UDP 表把本地端点映射到进程 ID（对应原 `ProcessFlowFilter.cs`）。
+//! 根据系统 TCP/UDP 表把本地端点映射到进程 ID。
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;

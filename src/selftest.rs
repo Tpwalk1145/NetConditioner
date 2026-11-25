@@ -1,4 +1,4 @@
-//! 自测（对应原 SelfTest）。自测使用本机回环端口和公网 80 端口，不影响 443 连接。
+//! 管理员模式综合自测：会写入临时文件、加载 WinDivert 并进行真实网络验证。
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -714,7 +714,7 @@ pub fn run() -> i32 {
         None => log.fail("停止后未恢复：连接失败"),
     }
 
-    // 11) 真实网卡方向验证（可选）：只影响公网 80 端口，不碰 443。
+    // 11) 真实网卡方向验证（可选）：访问 1.1.1.1:80。
     const REMOTE_HOST: &str = "1.1.1.1";
     const REMOTE_PORT: u16 = 80;
     match measure_tcp_connect_best(REMOTE_HOST, REMOTE_PORT, 3, 2000) {

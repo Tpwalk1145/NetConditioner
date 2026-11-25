@@ -36,7 +36,7 @@ impl EngineEvents {
     }
 }
 
-/// 统计快照，避免 UI 线程长时间持锁。
+/// 统计快照，避免 UI 线程长时间持锁；sent 包含直通流量。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StatsSnapshot {
     pub sent: u64,

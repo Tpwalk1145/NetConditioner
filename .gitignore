@@ -9,5 +9,5 @@ target/
 # 调试符号
 *.pdb
 
-# 安装包输出
+# 发布产物（单文件 exe 与 latest.json）
 dist/

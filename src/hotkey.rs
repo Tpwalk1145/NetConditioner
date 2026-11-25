@@ -1,4 +1,4 @@
-//! 全局热键的校验与显示（对应原 `HotkeyFormatter.cs`）。
+//! 全局热键的校验与显示。
 
 use crate::config::{MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
 
@@ -37,7 +37,7 @@ pub fn format(modifiers: u32, key: i32) -> String {
     parts.join(" + ")
 }
 
-/// 把虚拟键码转成 WinForms `Keys` 枚举里的显示名。
+/// 把虚拟键码转成显示名。
 pub fn key_name(key: i32) -> String {
     match key {
         0x08 => "Back".into(),

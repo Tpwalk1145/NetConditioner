@@ -1,4 +1,4 @@
-//! 目标进程选择对话框（对应原 ProcessSelectorForm）。
+//! 目标进程选择对话框。
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::HDC;

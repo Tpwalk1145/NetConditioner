@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    NetConditioner 一键构建：cargo 编译 + 测试 + 生成单文件 exe（可选生成云更新清单）。
+    NetConditioner 一键构建：cargo 编译 + 测试 + 生成单文件 exe 与云更新清单。
 
 .DESCRIPTION
     默认按顺序执行：
@@ -10,10 +10,12 @@
       3. 把 target\release\NetConditioner.exe 复制为
          dist\NetConditioner-<version>-win-x64.exe，并生成 dist\latest.json
 
-    单文件版已内置 WinDivert 运行时，首次运行会自动解压到
-    %ProgramFiles%\NetConditioner\runtime\<版本>\，不再需要安装包。
+    单文件版已内置 WinDivert 运行时，首次启用弱网引擎时会准备到
+    %ProgramFiles%\NetConditioner\runtime\<版本>\。构建产物为单文件 exe 与 latest.json。
+    -Version 只影响产物文件名和 latest.json，不改变 exe 内嵌版本。
 
     依赖：Rust（MSVC 工具链，需要 VS2022 Build Tools + Windows SDK）。
+    构建时请选择 x64 MSVC target，产物按 win-x64 命名。
 
 .EXAMPLE
     .\build.ps1

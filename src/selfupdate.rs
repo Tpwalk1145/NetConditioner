@@ -46,7 +46,7 @@ pub fn parse_args(args: &[String]) -> Option<ApplyArgs> {
     })
 }
 
-/// 更新助手进程：等待旧进程退出，替换 exe，必要时重新启动。
+/// 更新助手进程：等待旧进程退出，替换 exe，必要时重新启动；下载阶段已完成 SHA256 校验。
 pub fn run_helper(args: &ApplyArgs) -> i32 {
     wait_for_process(args.parent_pid, Duration::from_secs(30));
 
@@ -98,7 +98,7 @@ pub fn run_helper(args: &ApplyArgs) -> i32 {
     0
 }
 
-/// 由旧版本进程调用：复制自身为助手并启动它，然后由调用方退出。
+/// 复制当前 exe 为助手并启动，然后由调用方退出。
 pub fn spawn_helper(target: &Path, new_file: &Path) -> Result<(), String> {
     let current =
         std::env::current_exe().map_err(|error| format!("读取当前程序路径失败：{error}"))?;

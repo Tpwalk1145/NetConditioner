@@ -1,6 +1,6 @@
-//! WinDivert 2.2.x 动态加载与薄 FFI 封装（对应原 `WinDivertNative.cs`）。
+//! WinDivert 2.2.x 动态加载与薄 FFI 封装。
 //!
-//! 单文件分发：DLL 与驱动编进 exe，首次使用时解压到运行时目录，
+//! DLL 与驱动编进 exe，首次打开弱网引擎时准备到运行时目录，
 //! 再用 `LoadLibraryExW(LOAD_WITH_ALTERED_SEARCH_PATH)` 从该目录加载，
 //! 保证 WinDivert 能在 DLL 同目录找到 WinDivert64.sys。
 
@@ -241,7 +241,7 @@ pub fn open(filter: &str) -> Result<isize, String> {
     Ok(handle)
 }
 
-/// 返回告警文本（队列长度设置失败时），失败不影响启动。
+/// 尽力设置 WinDivert 队列参数，返回可选的告警文本。
 pub fn set_params(handle: isize) -> Option<String> {
     let api = api().ok()?;
     let mut warning = None;

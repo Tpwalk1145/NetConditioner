@@ -22,7 +22,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let has_flag = |flag: &str| args.iter().any(|arg| arg.eq_ignore_ascii_case(flag));
 
-    // 自更新助手：不创建互斥体、不弹 UI，等旧进程退出后替换自身并重启。
+    // 自更新助手等待旧进程退出后替换自身并重启。
     if selfupdate::is_helper_mode(&args) {
         let code = match selfupdate::parse_args(&args) {
             Some(apply) => selfupdate::run_helper(&apply),

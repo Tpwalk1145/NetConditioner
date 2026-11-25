@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-/// 4 段数字版本，与 .NET 的 `System.Version` 语义一致。
+/// 4 段数字版本，按逐段字典序比较。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(pub u32, pub u32, pub u32, pub u32);
 
@@ -52,7 +52,7 @@ pub fn parse(text: &str) -> Option<Version> {
             return None;
         }
         let value: u32 = part.parse().ok()?;
-        // .NET 用 int 解析，超出范围视为无效。
+        // 每段限制在有符号 32 位范围内。
         if value > i32::MAX as u32 {
             return None;
         }

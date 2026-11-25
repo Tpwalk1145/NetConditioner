@@ -1,4 +1,4 @@
-//! 云更新的网络与自更新部分（对应原 UpdateService，单文件版）。
+//! 云更新的网络与自更新部分。
 
 pub mod coordinator;
 
@@ -140,8 +140,7 @@ pub fn try_parse_manifest(json: &str) -> Result<(UpdateManifest, Version), Strin
 }
 
 fn build_agent(timeout: Duration) -> ureq::Agent {
-    // 必须显式指定 native-tls + 系统证书存储：ureq 默认是 rustls/WebPki，
-    // 在本项目未启用对应 feature 时 https 请求会直接 panic。
+    // 使用 native-tls 和平台根证书；ureq 需要显式选择 TLS 后端。
     let tls = ureq::tls::TlsConfig::builder()
         .provider(ureq::tls::TlsProvider::NativeTls)
         .root_certs(ureq::tls::RootCerts::PlatformVerifier)
@@ -208,7 +207,7 @@ fn part_path(destination: &Path) -> PathBuf {
     PathBuf::from(text)
 }
 
-/// 下载更新包到 destination，边下边算 SHA256，校验 size 与哈希后原子落盘。
+/// 下载更新包到 destination，边下边算 SHA256，校验 size 与哈希后重命名。
 pub fn download(manifest: &UpdateManifest, destination: &Path) -> bool {
     let Some(installer) = manifest.installer.as_ref() else {
         log("下载失败：更新包地址或 SHA256 无效。");
@@ -323,7 +322,7 @@ pub fn download(manifest: &UpdateManifest, destination: &Path) -> bool {
     true
 }
 
-/// 启动自更新助手：等待当前进程退出后把新 exe 覆盖到自身位置并重启。
+/// 启动自更新助手：等待当前进程退出后通过文件复制覆盖自身并重启。
 pub fn apply_self_update(new_file: &Path) -> bool {
     if is_dry_run() {
         log("DRY RUN：跳过实际更新。");
@@ -412,7 +411,7 @@ pub fn log(message: &str) {
     }
 }
 
-/// 与旧版本保持同名的门面，便于调用处读起来一致。
+/// 更新服务门面。
 pub struct UpdateService;
 
 impl UpdateService {

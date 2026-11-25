@@ -1,4 +1,4 @@
-//! 主窗口布局（对应原 `MainForm`）。
+//! 主窗口布局。
 
 use std::collections::HashMap;
 

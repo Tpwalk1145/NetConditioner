@@ -1,4 +1,4 @@
-//! 全静默云更新状态机（对应原 UpdateCoordinator）。
+//! 全静默云更新状态机。
 
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
@@ -50,7 +50,7 @@ pub fn should_check(settings: &AppSettings, now: i64) -> bool {
     if settings.last_update_check_unix <= 0 {
         return true;
     }
-    // 时钟被往回调过时也允许检查，避免永远不再检查。
+    // 时钟回拨时重新检查。
     if settings.last_update_check_unix > now {
         return true;
     }

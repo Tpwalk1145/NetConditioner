@@ -1,6 +1,6 @@
-//! 配置模型与清洗规则（对应原 `Models/*.cs`）。
+//! 配置模型与清洗规则。
 //!
-//! JSON 格式必须与 .NET 版本保持一致：camelCase 属性名、枚举写字符串、缩进输出。
+//! JSON 沿用旧版格式约定：camelCase 属性名、枚举写字符串、缩进输出。
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashSet;
@@ -9,7 +9,7 @@ pub mod store;
 
 pub use store::ProfileStore;
 
-/// 目标进程上限（对应 `ProcessFlowFilter.MaxProcessCount`）。
+/// 目标进程上限。
 pub const MAX_PROCESS_COUNT: usize = 64;
 
 // Win32 MOD_* 常量（不含 MOD_NOREPEAT）。
@@ -258,7 +258,7 @@ impl AppConfig {
 
 impl<'de> Deserialize<'de> for AppConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // 与 C# 反序列化语义对齐：字段缺失走默认值，引用类型显式 null 留给清洗处理。
+        // 字段缺失走默认值，引用类型显式 null 留给清洗处理。
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "camelCase", default)]
         struct RawConfig {
@@ -345,7 +345,7 @@ pub struct SanitizeOutcome {
     pub removed_profiles: usize,
 }
 
-/// 读取配置后统一清洗，等价于 `ProfileStore.Sanitize`。
+/// 读取配置后统一清洗。
 pub fn sanitize(config: &mut AppConfig, now_unix: i64) -> SanitizeOutcome {
     config.settings.max_run_minutes = config.settings.max_run_minutes.clamp(0, 1440);
     config.settings.max_queue_delay_ms = config.settings.max_queue_delay_ms.clamp(0, 60000);
@@ -417,7 +417,7 @@ fn sanitize_feed_url(raw: &str) -> String {
     }
 }
 
-/// 生成 32 位小写十六进制 Id（对应 `Guid.NewGuid().ToString("N")`）。
+/// 生成 32 位小写十六进制 Id。
 pub fn new_id() -> String {
     let mut id = String::with_capacity(32);
     for _ in 0..4 {

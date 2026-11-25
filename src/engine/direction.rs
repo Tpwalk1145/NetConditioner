@@ -1,4 +1,4 @@
-//! 单个方向（出站/入站）的弱网处理引擎（对应原 `DirectionEngine.cs`）。
+//! 单个方向（出站/入站）的弱网处理引擎。
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -18,7 +18,7 @@ const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
 const SEND_BATCH_SIZE: usize = 64;
 const POOL_LIMIT: usize = 1024;
 
-/// 实时统计：发送、丢弃、队列长度。
+/// 实时统计：发送、丢弃、队列长度；发送包含直通放行的包。
 pub struct DirectionStats {
     sent: AtomicU64,
     dropped: AtomicU64,
@@ -354,7 +354,7 @@ impl DirectionEngine {
 
         self.stop.store(true, AtomicOrdering::Release);
 
-        // 注意：不能提前把 handle 置空，否则发送线程在停止时无法重注入队列里剩余包。
+        // 停止期间保留 WinDivert 句柄，供发送线程重注入队列中的剩余包。
         {
             let mut guard = self.handle.lock().unwrap();
             if let Some(handle) = *guard {

@@ -1,4 +1,4 @@
-//! 配置文件的读取、校验与原子写入（对应原 `ProfileStore.cs`）。
+//! 配置文件的读取、校验与原子写入。
 
 use std::fs;
 use std::path::PathBuf;

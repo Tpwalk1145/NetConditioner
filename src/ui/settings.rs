@@ -1,4 +1,4 @@
-//! 设置对话框（对应原 SettingsForm）。
+//! 设置对话框。
 
 use std::sync::atomic::{AtomicIsize, Ordering};
 
