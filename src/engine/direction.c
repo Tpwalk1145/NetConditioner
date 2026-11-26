@@ -704,7 +704,6 @@ static unsigned __stdcall sender_main(void *parameter) {
             QueuedItem *item = queue_pop(&engine->queue);
             uint64_t packet_ns;
             uint64_t send_at;
-            bool send_failed;
             bool expired;
             engine->queue.bytes = engine->queue.bytes >= item->length ? engine->queue.bytes - item->length : 0;
             stats_set_queue(&engine->stats, engine->queue.len);
@@ -720,7 +719,6 @@ static unsigned __stdcall sender_main(void *parameter) {
             failed = stats_failed(&engine->stats);
             expired = !stopping && item->expires_ns > 0 &&
                       (nc_monotonic_ns() - engine->base_ns) > item->expires_ns;
-            send_failed = false;
             if (failed || expired) {
                 stats_add_dropped(&engine->stats);
             } else if (reporter_send(engine, item->data, (UINT)item->length, item->address)) {
@@ -728,10 +726,7 @@ static unsigned __stdcall sender_main(void *parameter) {
                     last_send_end_ns = sat_add(send_at, packet_ns);
                     has_last = true;
                 }
-            } else {
-                send_failed = true;
             }
-            (void)send_failed;
             return_item(engine, item);
             continue;
         }

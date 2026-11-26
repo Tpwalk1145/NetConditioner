@@ -9,11 +9,10 @@
 
 static INIT_ONCE g_wsa_once = INIT_ONCE_STATIC_INIT;
 
-static BOOL CALLBACK wsa_init_once(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+static BOOL CALLBACK wsa_init_once([[maybe_unused]] PINIT_ONCE once,
+                                   [[maybe_unused]] PVOID parameter,
+                                   [[maybe_unused]] PVOID *context) {
     WSADATA data;
-    (void)once;
-    (void)parameter;
-    (void)context;
     return WSAStartup(MAKEWORD(2, 2), &data) == 0;
 }
 
@@ -227,7 +226,7 @@ static bool ipv4_bytes_global(const unsigned char *bytes) {
 
 static bool ipv6_bytes_global(const unsigned char *bytes) {
     static const unsigned char loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
-    static const unsigned char unspecified[16] = {0};
+    static const unsigned char unspecified[16] = {};
     if (memcmp(bytes, loopback, 16) == 0 || memcmp(bytes, unspecified, 16) == 0) {
         return false;
     }

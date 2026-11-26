@@ -868,7 +868,6 @@ int nc_selftest_run(void) {
         NcVersion current;
         NcVersion candidate;
         char sha[65];
-        char buffer[32];
         nc_sha256_hex("abc", 3, sha);
         if (nc_version_parse("1.0.1", &candidate) && nc_version_parse("1.0.0", &current) &&
             nc_version_is_newer(&current, &candidate) &&
@@ -877,7 +876,6 @@ int nc_selftest_run(void) {
         } else {
             log_fail(&log, "云更新：版本号解析、比较或 SHA256 计算异常。");
         }
-        (void)buffer;
     }
 
     /* 4) latest.json 校验规则。 */

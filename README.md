@@ -2,7 +2,7 @@
 
 Windows 系统级弱网模拟工具，基于 WinDivert 为 TCP/UDP 上下行流量模拟延时、抖动、带宽限制、随机丢包与连续丢包。
 
-项目采用 **C17 + 原生 Win32 API** 编写，零第三方运行库依赖；默认使用完整 LLVM 工具链（`clang-cl` / `lld-link` / `llvm-rc`）编译为单个 x64 可执行文件，内嵌 WinDivert 运行时，同时保留 MSVC 回退构建选项。
+项目采用 **C23 + 原生 Win32 API** 编写，零第三方运行库依赖；默认使用完整 LLVM 工具链（`clang-cl` / `lld-link` / `llvm-rc`）编译为单个 x64 可执行文件，内嵌 WinDivert 运行时，同时保留 MSVC 回退构建选项。
 
 ## 特性一览
 

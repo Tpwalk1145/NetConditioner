@@ -965,10 +965,9 @@ void nc_format_local_hms(char *buf, size_t cap) {
              (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
 }
 
-static BOOL CALLBACK monotonic_init(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+static BOOL CALLBACK monotonic_init([[maybe_unused]] PINIT_ONCE once, PVOID parameter,
+                                    [[maybe_unused]] PVOID *context) {
     LARGE_INTEGER *state = (LARGE_INTEGER *)parameter;
-    (void)once;
-    (void)context;
     QueryPerformanceFrequency(&state[0]);
     QueryPerformanceCounter(&state[1]);
     return TRUE;

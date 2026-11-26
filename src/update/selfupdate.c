@@ -165,8 +165,8 @@ int nc_selfupdate_run_helper(int argc, wchar_t **argv) {
     void *target_bytes = NULL;
     size_t target_length = 0;
     char target_hash[65];
-    wchar_t stage_path[32768] = {0};
-    wchar_t backup_path[32768] = {0};
+    wchar_t stage_path[32768] = {};
+    wchar_t backup_path[32768] = {};
     char message[1200];
     if (!parse_args(argc, argv, &args)) {
         return 2;
