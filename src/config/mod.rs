@@ -3,6 +3,7 @@
 //! JSON 沿用旧版格式约定：camelCase 属性名、枚举写字符串、缩进输出。
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 
 pub mod store;
@@ -23,17 +24,12 @@ pub const DEFAULT_HOTKEY_MODIFIERS: u32 = MOD_CONTROL | MOD_ALT;
 pub const DEFAULT_HOTKEY_KEY: i32 = 0x55; // VK_U
 
 /// 弱网控制协议，数值与界面显示的 TCP (1) / UDP (2) / ALL (3) 一致。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ConditionProtocol {
     Tcp,
     Udp,
+    #[default]
     All,
-}
-
-impl Default for ConditionProtocol {
-    fn default() -> Self {
-        ConditionProtocol::All
-    }
 }
 
 /// 全局热键。Modifiers 使用 Win32 MOD_* 标志（不含 MOD_NOREPEAT）。
@@ -54,7 +50,7 @@ impl Default for HotkeySettings {
 }
 
 /// 单个方向的弱网参数。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DirectionProfile {
     pub delay_ms: i32,
@@ -63,19 +59,6 @@ pub struct DirectionProfile {
     pub random_loss_percent: i32,
     pub burst_allow_ms: i32,
     pub burst_drop_ms: i32,
-}
-
-impl Default for DirectionProfile {
-    fn default() -> Self {
-        Self {
-            delay_ms: 0,
-            jitter_ms: 0,
-            bandwidth_kbps: 0,
-            random_loss_percent: 0,
-            burst_allow_ms: 0,
-            burst_drop_ms: 0,
-        }
-    }
 }
 
 impl DirectionProfile {
@@ -207,6 +190,9 @@ pub struct AppConfig {
     pub profiles: Vec<NetworkProfile>,
     pub hotkey: HotkeySettings,
     pub settings: AppSettings,
+    /// Unknown root fields survive a read/save cycle.
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, Value>,
 }
 
 impl Default for AppConfig {
@@ -217,6 +203,7 @@ impl Default for AppConfig {
             profiles: Vec::new(),
             hotkey: HotkeySettings::default(),
             settings: AppSettings::default(),
+            extra: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -258,73 +245,84 @@ impl AppConfig {
 
 impl<'de> Deserialize<'de> for AppConfig {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // 字段缺失走默认值，引用类型显式 null 留给清洗处理。
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "camelCase", default)]
         struct RawConfig {
             version: Option<i32>,
             active_profile_id: Option<String>,
             profiles: Option<Vec<Option<RawProfile>>>,
-            hotkey: Option<HotkeySettings>,
-            settings: Option<RawSettings>,
+            hotkey: Option<Value>,
+            settings: Option<Value>,
+            #[serde(flatten)]
+            extra: std::collections::BTreeMap<String, Value>,
         }
 
         #[derive(Deserialize, Default)]
         #[serde(rename_all = "camelCase", default)]
         struct RawProfile {
             id: Option<String>,
-            // 缺失时保留默认名称；显式 null 交给清洗删除。
             #[serde(default = "default_profile_name")]
             name: Option<String>,
-            uplink: Option<DirectionProfile>,
-            downlink: Option<DirectionProfile>,
+            uplink: Option<Value>,
+            downlink: Option<Value>,
             protocol: Option<ConditionProtocol>,
-        }
-
-        #[derive(Deserialize, Default)]
-        #[serde(rename_all = "camelCase", default)]
-        struct RawSettings {
-            max_run_minutes: Option<i32>,
-            max_queue_delay_ms: Option<i32>,
-            process_names: Option<Vec<String>>,
-            update_feed_url: Option<String>,
-            auto_update: Option<bool>,
-            last_update_check_unix: Option<i64>,
-            last_update_attempt_unix: Option<i64>,
-            last_attempted_version: Option<String>,
         }
 
         fn default_profile_name() -> Option<String> {
             Some("默认配置".to_string())
         }
 
+        fn field<T: serde::de::DeserializeOwned>(value: &Value, name: &str) -> Option<T> {
+            serde_json::from_value(value.get(name).cloned().unwrap_or(Value::Null)).ok()
+        }
+
+        fn direction(value: Option<Value>) -> DirectionProfile {
+            let Some(value) = value else {
+                return DirectionProfile::default();
+            };
+            DirectionProfile {
+                delay_ms: field(&value, "delayMs").unwrap_or(0),
+                jitter_ms: field(&value, "jitterMs").unwrap_or(0),
+                bandwidth_kbps: field(&value, "bandwidthKbps").unwrap_or(0),
+                random_loss_percent: field(&value, "randomLossPercent").unwrap_or(0),
+                burst_allow_ms: field(&value, "burstAllowMs").unwrap_or(0),
+                burst_drop_ms: field(&value, "burstDropMs").unwrap_or(0),
+            }
+        }
+
         let raw = RawConfig::deserialize(deserializer)?;
-
-        let settings = match raw.settings {
-            Some(settings) => AppSettings {
-                max_run_minutes: settings.max_run_minutes.unwrap_or(0),
-                max_queue_delay_ms: settings.max_queue_delay_ms.unwrap_or(2000),
-                process_names: settings.process_names.unwrap_or_default(),
-                update_feed_url: settings.update_feed_url.unwrap_or_default(),
-                auto_update: settings.auto_update.unwrap_or(true),
-                last_update_check_unix: settings.last_update_check_unix.unwrap_or(0),
-                last_update_attempt_unix: settings.last_update_attempt_unix.unwrap_or(0),
-                last_attempted_version: settings.last_attempted_version.unwrap_or_default(),
-            },
-            None => AppSettings::default(),
+        let empty = Value::Object(serde_json::Map::new());
+        let settings = raw.settings.unwrap_or(empty.clone());
+        let settings = AppSettings {
+            max_run_minutes: field(&settings, "maxRunMinutes").unwrap_or(0),
+            max_queue_delay_ms: field(&settings, "maxQueueDelayMs").unwrap_or(2000),
+            process_names: field::<Vec<Value>>(&settings, "processNames")
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect(),
+            update_feed_url: field(&settings, "updateFeedUrl").unwrap_or_default(),
+            auto_update: field(&settings, "autoUpdate").unwrap_or(true),
+            last_update_check_unix: field(&settings, "lastUpdateCheckUnix").unwrap_or(0),
+            last_update_attempt_unix: field(&settings, "lastUpdateAttemptUnix").unwrap_or(0),
+            last_attempted_version: field(&settings, "lastAttemptedVersion").unwrap_or_default(),
         };
-
+        let hotkey = raw.hotkey.unwrap_or(empty);
+        let hotkey = HotkeySettings {
+            modifiers: field(&hotkey, "modifiers").unwrap_or(DEFAULT_HOTKEY_MODIFIERS),
+            key: field(&hotkey, "key").unwrap_or(DEFAULT_HOTKEY_KEY),
+        };
         let profiles = raw
             .profiles
             .unwrap_or_default()
             .into_iter()
             .flatten()
-            .map(|raw_profile| NetworkProfile {
-                id: raw_profile.id.unwrap_or_default(),
-                name: raw_profile.name.unwrap_or_default(),
-                uplink: raw_profile.uplink.unwrap_or_default(),
-                downlink: raw_profile.downlink.unwrap_or_default(),
-                protocol: raw_profile.protocol.unwrap_or_default(),
+            .map(|raw| NetworkProfile {
+                id: raw.id.unwrap_or_default(),
+                name: raw.name.unwrap_or_default(),
+                uplink: direction(raw.uplink),
+                downlink: direction(raw.downlink),
+                protocol: raw.protocol.unwrap_or_default(),
             })
             .collect();
 
@@ -332,8 +330,9 @@ impl<'de> Deserialize<'de> for AppConfig {
             version: raw.version.unwrap_or(1),
             active_profile_id: raw.active_profile_id,
             profiles,
-            hotkey: raw.hotkey.unwrap_or_default(),
+            hotkey,
             settings,
+            extra: raw.extra,
         })
     }
 }
@@ -347,6 +346,13 @@ pub struct SanitizeOutcome {
 
 /// 读取配置后统一清洗。
 pub fn sanitize(config: &mut AppConfig, now_unix: i64) -> SanitizeOutcome {
+    config.hotkey.modifiers &= MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN;
+    if config.hotkey.modifiers == 0 {
+        config.hotkey.modifiers = DEFAULT_HOTKEY_MODIFIERS;
+    }
+    if !(1..=0xff).contains(&config.hotkey.key) {
+        config.hotkey.key = DEFAULT_HOTKEY_KEY;
+    }
     config.settings.max_run_minutes = config.settings.max_run_minutes.clamp(0, 1440);
     config.settings.max_queue_delay_ms = config.settings.max_queue_delay_ms.clamp(0, 60000);
     config.settings.process_names = sanitize_process_names(&config.settings.process_names);
@@ -433,14 +439,13 @@ pub fn normalize_process_name(name: &str) -> String {
         return String::new();
     }
 
-    let file_name = trimmed.rsplit(['\\', '/']).next().unwrap_or("").trim();
+    let mut file_name = trimmed.rsplit(['\\', '/']).next().unwrap_or("").trim();
 
-    let file_name =
-        if file_name.len() >= 4 && file_name[file_name.len() - 4..].eq_ignore_ascii_case(".exe") {
-            &file_name[..file_name.len() - 4]
-        } else {
-            file_name
-        };
+    if let Some(stem) = file_name.get(file_name.len().saturating_sub(4)..) {
+        if stem.eq_ignore_ascii_case(".exe") {
+            file_name = &file_name[..file_name.len() - 4];
+        }
+    }
 
     file_name.trim().to_lowercase()
 }
@@ -575,6 +580,43 @@ mod tests {
         sanitize(&mut config, 0);
         assert_eq!(config.profiles.len(), 2);
         assert_ne!(config.profiles[0].id, config.profiles[1].id);
+    }
+
+    #[test]
+    fn unicode_process_names_are_character_safe() {
+        assert_eq!(normalize_process_name("应用.EXE"), "应用");
+        assert_eq!(normalize_process_name("ééé.ExE"), "ééé");
+        assert_eq!(normalize_process_name("C:\\工具\\应用.exe"), "应用");
+        assert_eq!(normalize_display_name("ééé"), "ééé.exe");
+        assert_eq!(normalize_process_name("应用"), "应用");
+    }
+
+    #[test]
+    fn invalid_hotkey_is_sanitized() {
+        let mut config: AppConfig = serde_json::from_str(
+            r#"{"hotkey":{"modifiers":-1,"key":0},"settings":{"maxRunMinutes":"bad","processNames":["ok.exe",3,null]}}"#,
+        ).expect("parse");
+        sanitize(&mut config, 0);
+        assert_eq!(config.hotkey.modifiers, DEFAULT_HOTKEY_MODIFIERS);
+        assert_eq!(config.hotkey.key, DEFAULT_HOTKEY_KEY);
+        assert_eq!(config.settings.process_names, vec!["ok.exe"]);
+        config.hotkey.modifiers = MOD_NOREPEAT;
+        config.hotkey.key = 300;
+        sanitize(&mut config, 0);
+        assert_eq!(config.hotkey.modifiers, DEFAULT_HOTKEY_MODIFIERS);
+        assert_eq!(config.hotkey.key, DEFAULT_HOTKEY_KEY);
+    }
+
+    #[test]
+    fn malformed_individual_fields_do_not_discard_whole_config() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{"version":1,"future":7,"profiles":[{"id":"p","name":"kept","uplink":{"delayMs":"bad","jitterMs":9}}],"settings":{"maxRunMinutes":"bad","futureField":true}}"#,
+        ).expect("parse");
+        assert_eq!(config.profiles[0].name, "kept");
+        assert_eq!(config.profiles[0].uplink.delay_ms, 0);
+        assert_eq!(config.profiles[0].uplink.jitter_ms, 9);
+        assert_eq!(config.settings.max_run_minutes, 0);
+        assert_eq!(config.extra["future"], 7);
     }
 
     #[test]

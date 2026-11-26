@@ -8,8 +8,23 @@ pub struct FlowEndpoint {
     pub port: u16,
 }
 
+/// 解析后的流信息：协议号、本端端点和远端端点。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowPacket {
+    pub protocol: u8,
+    pub local: FlowEndpoint,
+    pub remote: FlowEndpoint,
+}
+
 /// 仅处理常见的 IPv4/IPv6 TCP/UDP 包；返回 (协议号, 本端端点)。
+#[cfg(test)]
 pub fn parse(packet: &[u8], outbound: bool) -> Option<(u8, FlowEndpoint)> {
+    parse_packet(packet, outbound).map(|flow| (flow.protocol, flow.local))
+}
+
+/// 解析 TCP/UDP 五元组。`outbound` 表示调用方希望把源端还是目的端视为本端；
+/// 它描述的是引擎方向，而不是 WinDivert 的 `outbound` 标志。
+pub fn parse_packet(packet: &[u8], outbound: bool) -> Option<FlowPacket> {
     if packet.len() < 24 {
         return None;
     }
@@ -35,21 +50,38 @@ pub fn parse(packet: &[u8], outbound: bool) -> Option<(u8, FlowEndpoint)> {
         let destination = read_u32(packet, 16) as u128;
         let source_port = read_u16(packet, header_length);
         let destination_port = read_u16(packet, header_length + 2);
-
-        let local = if outbound {
-            FlowEndpoint {
-                family: 4,
-                address: source,
-                port: source_port,
-            }
+        let (local, remote) = if outbound {
+            (
+                FlowEndpoint {
+                    family: 4,
+                    address: source,
+                    port: source_port,
+                },
+                FlowEndpoint {
+                    family: 4,
+                    address: destination,
+                    port: destination_port,
+                },
+            )
         } else {
-            FlowEndpoint {
-                family: 4,
-                address: destination,
-                port: destination_port,
-            }
+            (
+                FlowEndpoint {
+                    family: 4,
+                    address: destination,
+                    port: destination_port,
+                },
+                FlowEndpoint {
+                    family: 4,
+                    address: source,
+                    port: source_port,
+                },
+            )
         };
-        return Some((protocol, local));
+        return Some(FlowPacket {
+            protocol,
+            local,
+            remote,
+        });
     }
 
     if version == 6 {
@@ -87,18 +119,28 @@ pub fn parse(packet: &[u8], outbound: bool) -> Option<(u8, FlowEndpoint)> {
         let destination = read_u128(packet, 24);
         let source_port = read_u16(packet, offset);
         let destination_port = read_u16(packet, offset + 2);
-
-        let (family, address) = normalize_address(if outbound { source } else { destination });
-        let local = FlowEndpoint {
-            family,
-            address,
-            port: if outbound {
-                source_port
-            } else {
-                destination_port
-            },
+        let (source_family, source_address) = normalize_address(source);
+        let (destination_family, destination_address) = normalize_address(destination);
+        let source_endpoint = FlowEndpoint {
+            family: source_family,
+            address: source_address,
+            port: source_port,
         };
-        return Some((next, local));
+        let destination_endpoint = FlowEndpoint {
+            family: destination_family,
+            address: destination_address,
+            port: destination_port,
+        };
+        let (local, remote) = if outbound {
+            (source_endpoint, destination_endpoint)
+        } else {
+            (destination_endpoint, source_endpoint)
+        };
+        return Some(FlowPacket {
+            protocol: next,
+            local,
+            remote,
+        });
     }
 
     None
@@ -176,6 +218,18 @@ mod tests {
                 port: 8080
             }
         );
+    }
+
+    #[test]
+    fn parses_remote_endpoint_for_process_attribution() {
+        let packet = ipv4_tcp([127, 0, 0, 1], [127, 0, 0, 1], 40000, 8080);
+        let flow = parse_packet(&packet, true).unwrap();
+        assert_eq!(flow.local.port, 40000);
+        assert_eq!(flow.remote.port, 8080);
+
+        let response = parse_packet(&packet, false).unwrap();
+        assert_eq!(response.local.port, 8080);
+        assert_eq!(response.remote.port, 40000);
     }
 
     #[test]

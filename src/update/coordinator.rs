@@ -61,10 +61,9 @@ fn retry_blocked(snapshot: &UpdateSettingsSnapshot, version: &Option<String>, no
     let Some(version) = version else {
         return false;
     };
-    if !snapshot
-        .last_attempted_version
-        .eq_ignore_ascii_case(version)
-    {
+    let previous = crate::version::parse(snapshot.last_attempted_version.trim());
+    let candidate = crate::version::parse(version.trim());
+    if previous != candidate {
         return false;
     }
     if snapshot.last_update_attempt_unix <= 0 {
@@ -88,7 +87,10 @@ pub fn spawn_tick(
 }
 
 fn run_tick(feed_url: &str, current: Version, snapshot: &UpdateSettingsSnapshot) -> TickOutcome {
-    UpdateService::log(&format!("开始检查更新：{feed_url}"));
+    UpdateService::log(&format!(
+        "开始检查更新：{}",
+        crate::neturl::redact_url_for_log(feed_url)
+    ));
     let now = config::now_unix();
 
     match crate::update::check(feed_url, current) {
@@ -120,5 +122,33 @@ fn run_tick(feed_url: &str, current: Version, snapshot: &UpdateSettingsSnapshot)
                 now,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equivalent_version_strings_suppress_retry() {
+        for (previous, candidate) in [
+            ("1.2.3", "1.2.3.0"),
+            (" 01.002.0003 ", "1.2.3"),
+            ("1.2", "1.2.0.0"),
+        ] {
+            let snapshot = UpdateSettingsSnapshot {
+                last_update_attempt_unix: 100,
+                last_attempted_version: previous.to_string(),
+            };
+            assert!(retry_blocked(&snapshot, &Some(candidate.to_string()), 200));
+        }
+        assert!(!retry_blocked(
+            &UpdateSettingsSnapshot {
+                last_update_attempt_unix: 100,
+                last_attempted_version: "1.2.3".to_string(),
+            },
+            &Some("1.2.4".to_string()),
+            200
+        ));
     }
 }

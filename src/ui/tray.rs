@@ -50,6 +50,18 @@ impl Tray {
         }
     }
 
+    pub fn restore(&mut self) {
+        unsafe {
+            if self.added && Shell_NotifyIconW(NIM_MODIFY, &self.data) != 0 {
+                return;
+            }
+            if self.added {
+                Shell_NotifyIconW(NIM_DELETE, &self.data);
+            }
+        }
+        self.added = unsafe { Shell_NotifyIconW(NIM_ADD, &self.data) } != 0;
+    }
+
     pub fn set_running(&mut self, running: bool) {
         self.data.hIcon = if running { self.active } else { self.normal };
         win::write_fixed(
@@ -61,6 +73,10 @@ impl Tray {
             },
         );
         self.data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        if !self.added {
+            self.restore();
+            return;
+        }
         unsafe {
             Shell_NotifyIconW(NIM_MODIFY, &self.data);
         }

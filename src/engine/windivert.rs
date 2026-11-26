@@ -60,7 +60,7 @@ struct Api {
 unsafe impl Send for Api {}
 unsafe impl Sync for Api {}
 
-static API: OnceLock<Result<Api, String>> = OnceLock::new();
+static API: OnceLock<Api> = OnceLock::new();
 
 const WINDIVERT_DLL_BYTES: &[u8] = include_bytes!("../../third_party/WinDivert/WinDivert.dll");
 const WINDIVERT_SYS_BYTES: &[u8] = include_bytes!("../../third_party/WinDivert/WinDivert64.sys");
@@ -201,9 +201,17 @@ fn load() -> Result<Api, String> {
 }
 
 fn api() -> Result<&'static Api, String> {
-    API.get_or_init(load)
-        .as_ref()
-        .map_err(|error| error.clone())
+    if let Some(api) = API.get() {
+        return Ok(api);
+    }
+    match load() {
+        Ok(api) => {
+            // 只缓存成功结果；DLL/驱动暂时不可用时允许后续启动重试。
+            let _ = API.set(api);
+            Ok(API.get().expect("WinDivert API initialized"))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub fn describe_open_error(code: i32) -> String {
@@ -234,7 +242,7 @@ fn last_error_code() -> i32 {
 pub fn open(filter: &str) -> Result<isize, String> {
     let api = api()?;
     let filter = CString::new(filter).map_err(|_| "WinDivert 过滤器包含非法字符。".to_string())?;
-    let handle = unsafe { (api.open)(filter.as_ptr() as *const i8, LAYER_NETWORK, 0, 0) };
+    let handle = unsafe { (api.open)(filter.as_ptr(), LAYER_NETWORK, 0, 0) };
     if handle == 0 || handle == -1 {
         return Err(describe_open_error(last_error_code()));
     }

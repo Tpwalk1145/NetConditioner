@@ -1,5 +1,6 @@
 //! 设置对话框。
 
+use std::rc::Rc;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows_sys::Win32::Foundation::*;
@@ -10,7 +11,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::app::{app, App, Dialog};
+use crate::app::App;
 use crate::config::{HotkeySettings, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN};
 use crate::hotkey;
 use crate::neturl;
@@ -43,14 +44,20 @@ pub struct SettingsDialog {
     max_queue: NumberInput,
     auto_update: HWND,
     feed_edit: HWND,
-    outcome: Option<SettingsOutcome>,
+    fonts: Rc<Fonts>,
+    pub outcome: Option<SettingsOutcome>,
 }
 
 impl SettingsDialog {
+    pub fn fonts(&self) -> &Fonts {
+        &self.fonts
+    }
+
     pub fn create(app: &mut App) -> Self {
         let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
-        let scale = app.main.as_ref().map(|main| main.scale).unwrap_or(1.0);
-        let fonts = &app.fonts;
+        let preferred_scale = app.main.as_ref().map(|main| main.scale).unwrap_or(1.0);
+        let scale = win::fit_dialog_scale(owner, CLIENT_WIDTH, CLIENT_HEIGHT, preferred_scale);
+        let fonts = Rc::new(Fonts::new((scale * 96.0).round() as u32));
         let s = |value: i32| (value as f64 * scale).round() as i32;
 
         let hwnd = win::create_window(
@@ -133,8 +140,10 @@ impl SettingsDialog {
         let new_proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
             hotkey_edit_proc;
         let old_proc = unsafe {
-            let old = SetWindowLongPtrW(hotkey_edit, GWLP_WNDPROC, new_proc as isize);
-            SetWindowLongPtrW(hotkey_edit, GWLP_USERDATA, old);
+            let old = SetWindowLongPtrW(hotkey_edit, GWLP_WNDPROC, new_proc as usize as isize);
+            if old != 0 {
+                SetWindowLongPtrW(hotkey_edit, GWLP_USERDATA, old);
+            }
             old
         };
         HOTKEY_EDIT_OLD_PROC.store(old_proc, Ordering::Relaxed);
@@ -388,6 +397,7 @@ impl SettingsDialog {
             max_queue,
             auto_update,
             feed_edit,
+            fonts,
             outcome: None,
         }
     }
@@ -413,12 +423,20 @@ impl SettingsDialog {
                 win::set_text_color(wparam as HDC, TEXT_DARK);
                 Some(app.white_brush as isize)
             }
+            WM_CTLCOLORBTN => {
+                let hwnd = lparam as HWND;
+                app.button_colors(hwnd).map(|(background, foreground)| {
+                    win::set_dc_brush_color(wparam as HDC, background);
+                    win::set_text_color(wparam as HDC, foreground);
+                    win::dc_brush() as isize
+                })
+            }
             WM_COMMAND => {
-                let id = (wparam & 0xFFFF) as usize;
+                let id = wparam & 0xFFFF;
                 let code = ((wparam >> 16) & 0xFFFF) as u32;
                 match id {
                     ids::SETTINGS_OK => self.confirm(app),
-                    ids::SETTINGS_CANCEL => self.cancel(),
+                    ids::SETTINGS_CANCEL => self.cancel(app),
                     ids::SETTINGS_MAXRUN_NUMBER | ids::SETTINGS_MAXQUEUE_NUMBER
                         if code == EN_KILLFOCUS =>
                     {
@@ -450,7 +468,7 @@ impl SettingsDialog {
                 Some(0)
             }
             WM_CLOSE => {
-                self.cancel();
+                self.cancel(app);
                 Some(0)
             }
             WM_DESTROY => {
@@ -489,8 +507,9 @@ impl SettingsDialog {
         let _ = fonts;
     }
 
-    pub fn cancel(&mut self) {
+    pub fn cancel(&mut self, app: &mut App) {
         self.closed = true;
+        app.cleanup_dialog_widgets(self.hwnd);
         win::destroy(self.hwnd);
     }
 
@@ -509,6 +528,17 @@ impl SettingsDialog {
         }
 
         let auto_update = win::send(self.auto_update, BM_GETCHECK, 0, 0) as u32 == BST_CHECKED;
+        let invalid = if self.max_run.is_valid() {
+            None
+        } else {
+            Some(self.max_run.edit)
+        }
+        .or_else(|| (!self.max_queue.is_valid()).then_some(self.max_queue.edit));
+        if let Some(edit) = invalid {
+            app.show_message("请输入有效的非负整数。", "设置无效", MB_OK | MB_ICONWARNING);
+            win::set_focus(edit);
+            return;
+        }
         self.outcome = Some(SettingsOutcome {
             hotkey: self.candidate.clone(),
             max_run_minutes: self.max_run.value(),
@@ -517,6 +547,7 @@ impl SettingsDialog {
             update_feed_url: feed_url,
         });
         self.closed = true;
+        app.cleanup_dialog_widgets(self.hwnd);
         win::destroy(self.hwnd);
     }
 }
@@ -534,11 +565,15 @@ unsafe extern "system" fn hotkey_edit_proc(
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let virtual_key = wparam as i32;
             if virtual_key == VK_ESCAPE as i32 {
-                app().settings_request_cancel();
+                if let Some(mut app) = crate::app::try_app() {
+                    app.settings_request_cancel();
+                }
                 return 0;
             }
             if virtual_key == VK_RETURN as i32 {
-                app().settings_request_confirm();
+                if let Some(mut app) = crate::app::try_app() {
+                    app.settings_request_confirm();
+                }
                 return 0;
             }
             if hotkey::is_modifier_key(virtual_key) {
@@ -559,28 +594,22 @@ unsafe extern "system" fn hotkey_edit_proc(
                 modifiers |= MOD_WIN;
             }
 
-            app().settings_hotkey_pressed(modifiers, virtual_key);
+            if let Some(mut app) = crate::app::try_app() {
+                app.settings_hotkey_pressed(modifiers, virtual_key);
+            }
             0
         }
-        _ => CallWindowProcW(
-            std::mem::transmute::<isize, WNDPROC>(old_proc),
-            hwnd,
-            message,
-            wparam,
-            lparam,
-        ),
-    }
-}
-
-pub fn open(app: &mut App) -> Option<SettingsOutcome> {
-    let dialog = SettingsDialog::create(app);
-    let hwnd = dialog.hwnd;
-    let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
-    app.dialog = Some(Dialog::Settings(dialog));
-    win::run_modal(owner, hwnd);
-
-    match app.dialog.take() {
-        Some(Dialog::Settings(dialog)) => dialog.outcome,
-        _ => None,
+        _ => {
+            if old_proc == 0 {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            CallWindowProcW(
+                std::mem::transmute::<isize, WNDPROC>(old_proc),
+                hwnd,
+                message,
+                wparam,
+                lparam,
+            )
+        }
     }
 }

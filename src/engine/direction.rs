@@ -8,21 +8,22 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::config::{ConditionProtocol, DirectionProfile};
-use crate::engine::flow::FlowEndpoint;
 use crate::engine::process_filter::ProcessFlowFilter;
 use crate::engine::windivert;
 use crate::engine::{EngineEvent, EngineEvents};
 
 const MAX_QUEUE_PACKETS: usize = 4096;
 const MAX_QUEUE_BYTES: usize = 8 * 1024 * 1024;
-const SEND_BATCH_SIZE: usize = 64;
 const POOL_LIMIT: usize = 1024;
+const ERROR_NO_DATA: i32 = 232;
+const WAIT_SLICE: Duration = Duration::from_millis(100);
 
 /// 实时统计：发送、丢弃、队列长度；发送包含直通放行的包。
 pub struct DirectionStats {
     sent: AtomicU64,
     dropped: AtomicU64,
     queue_count: AtomicU32,
+    failed: AtomicBool,
 }
 
 impl DirectionStats {
@@ -31,6 +32,7 @@ impl DirectionStats {
             sent: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             queue_count: AtomicU32::new(0),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -44,6 +46,10 @@ impl DirectionStats {
 
     pub fn queue_count(&self) -> u32 {
         self.queue_count.load(AtomicOrdering::Relaxed)
+    }
+
+    pub fn failed(&self) -> bool {
+        self.failed.load(AtomicOrdering::Acquire)
     }
 
     pub fn reset(&self) {
@@ -60,6 +66,10 @@ impl DirectionStats {
         self.dropped.fetch_add(1, AtomicOrdering::Relaxed);
     }
 
+    fn mark_failed(&self) -> bool {
+        !self.failed.swap(true, AtomicOrdering::AcqRel)
+    }
+
     fn set_queue(&self, value: usize) {
         self.queue_count
             .store(value as u32, AtomicOrdering::Relaxed);
@@ -68,50 +78,92 @@ impl DirectionStats {
 
 /// 连续丢包（放行/丢包时长循环）状态机。
 struct BurstLossState {
-    allow_ms: u64,
-    drop_ms: u64,
+    allow_ns: u64,
+    drop_ns: u64,
     phase_start_ns: u64,
-    dropping: bool,
 }
 
 impl BurstLossState {
     fn new(allow_ms: i32, drop_ms: i32, now_ns: u64) -> Self {
         Self {
-            allow_ms: allow_ms.max(0) as u64,
-            drop_ms: drop_ms.max(0) as u64,
+            allow_ns: allow_ms.max(0) as u64 * 1_000_000,
+            drop_ns: drop_ms.max(0) as u64 * 1_000_000,
             phase_start_ns: now_ns,
-            dropping: false,
         }
     }
 
-    fn should_drop(&mut self, now_ns: u64) -> bool {
-        if self.allow_ms == 0 && self.drop_ms == 0 {
+    fn should_drop(&self, now_ns: u64) -> bool {
+        if self.allow_ns == 0 && self.drop_ns == 0 {
             return false;
         }
-        if self.allow_ms == 0 {
+        if self.allow_ns == 0 {
             return true;
         }
-        if self.drop_ms == 0 {
+        if self.drop_ns == 0 {
             return false;
         }
 
-        // 最多循环几次，防止线程长时间停滞后死循环。
-        for _ in 0..4 {
-            let elapsed_ms = now_ns.saturating_sub(self.phase_start_ns) / 1_000_000;
-            let duration = if self.dropping {
-                self.drop_ms
-            } else {
-                self.allow_ms
-            };
-            if elapsed_ms < duration {
-                return self.dropping;
-            }
-            self.dropping = !self.dropping;
-            self.phase_start_ns = now_ns;
-        }
-
-        self.dropping
+        let cycle = self.allow_ns.saturating_add(self.drop_ns);
+        let elapsed = now_ns.saturating_sub(self.phase_start_ns);
+        elapsed % cycle >= self.allow_ns
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SendPlan {
+    due_ns: u64,
+    next_send_ns: u64,
+    expires_ns: u64,
+}
+
+/// 接收线程只计划发送时间；只有成功入队后才提交带宽进度。
+struct BandwidthScheduler {
+    next_send_ns: u64,
+}
+
+impl BandwidthScheduler {
+    fn new() -> Self {
+        Self { next_send_ns: 0 }
+    }
+
+    fn plan(
+        &self,
+        now_ns: u64,
+        intended_delay_ns: u64,
+        length: usize,
+        bandwidth_kbps: u64,
+        max_queue_ns: u64,
+    ) -> Option<SendPlan> {
+        let intended_due_ns = now_ns.saturating_add(intended_delay_ns);
+        let packet_ns = packet_service_ns(length, bandwidth_kbps);
+        let start_ns = intended_due_ns.max(self.next_send_ns);
+        let due_ns = start_ns.saturating_add(packet_ns);
+        let extra_ns = due_ns.saturating_sub(intended_due_ns);
+        if max_queue_ns > 0 && extra_ns > max_queue_ns {
+            return None;
+        }
+        let expires_ns = if max_queue_ns > 0 {
+            intended_due_ns.saturating_add(max_queue_ns)
+        } else {
+            0
+        };
+        Some(SendPlan {
+            due_ns,
+            next_send_ns: due_ns,
+            expires_ns,
+        })
+    }
+
+    fn commit(&mut self, plan: SendPlan) {
+        self.next_send_ns = self.next_send_ns.max(plan.next_send_ns);
+    }
+}
+
+fn packet_service_ns(length: usize, bandwidth_kbps: u64) -> u64 {
+    if bandwidth_kbps == 0 || length == 0 {
+        return 0;
+    }
+    ((length as u64 * 8 * 1_000_000_000) / (bandwidth_kbps * 1000)).max(1)
 }
 
 struct PacketItem {
@@ -119,6 +171,7 @@ struct PacketItem {
     address: [u8; windivert::ADDRESS_STRUCT_SIZE],
     length: usize,
     due_ns: u64,
+    expires_ns: u64,
     sequence: u64,
 }
 
@@ -129,6 +182,7 @@ impl PacketItem {
             address: [0u8; windivert::ADDRESS_STRUCT_SIZE],
             length: 0,
             due_ns: 0,
+            expires_ns: 0,
             sequence: 0,
         }
     }
@@ -137,6 +191,7 @@ impl PacketItem {
         self.data.clear();
         self.length = 0;
         self.due_ns = 0;
+        self.expires_ns = 0;
         self.sequence = 0;
     }
 }
@@ -177,6 +232,18 @@ struct QueueState {
     bytes: usize,
 }
 
+struct ReceiverDoneGuard {
+    done: Arc<AtomicBool>,
+    queue: Arc<(Mutex<QueueState>, Condvar)>,
+}
+
+impl Drop for ReceiverDoneGuard {
+    fn drop(&mut self) {
+        self.done.store(true, AtomicOrdering::Release);
+        self.queue.1.notify_all();
+    }
+}
+
 /// 一个方向的引擎：接收线程 + 发送线程。
 pub struct DirectionEngine {
     display_name: &'static str,
@@ -193,9 +260,11 @@ pub struct DirectionEngine {
     queue: Arc<(Mutex<QueueState>, Condvar)>,
     pool: Arc<Mutex<Vec<PacketItem>>>,
     stop: Arc<AtomicBool>,
+    receiver_done: Arc<AtomicBool>,
     receiver: Option<JoinHandle<()>>,
     sender: Option<JoinHandle<()>>,
     started: bool,
+    start_attempted: bool,
 }
 
 impl DirectionEngine {
@@ -239,9 +308,11 @@ impl DirectionEngine {
             )),
             pool: Arc::new(Mutex::new(Vec::new())),
             stop: Arc::new(AtomicBool::new(false)),
+            receiver_done: Arc::new(AtomicBool::new(false)),
             receiver: None,
             sender: None,
             started: false,
+            start_attempted: false,
         }
     }
 
@@ -250,9 +321,10 @@ impl DirectionEngine {
     }
 
     pub fn start(&mut self) -> Result<(), String> {
-        if self.started {
-            return Err("引擎已经启动。".to_string());
+        if self.start_attempted {
+            return Err("DirectionEngine 只能启动一次，停止后请创建新实例。".to_string());
         }
+        self.start_attempted = true;
 
         let handle = windivert::open(&self.filter)?;
         let _ = windivert::set_params(handle);
@@ -265,6 +337,7 @@ impl DirectionEngine {
         let stats = self.stats.clone();
         let events = self.events.clone();
         let fault_reported = Arc::new(AtomicBool::new(false));
+        let receiver_done = self.receiver_done.clone();
         let display = self.display_name;
 
         // 接收线程。
@@ -274,6 +347,7 @@ impl DirectionEngine {
         let receiver_stats = stats.clone();
         let receiver_events = events.clone();
         let receiver_fault_reported = fault_reported.clone();
+        let receiver_done_guard = receiver_done.clone();
         let profile = self.profile.clone();
         let protocol = self.protocol;
         let process_filter = self.process_filter.clone();
@@ -284,13 +358,17 @@ impl DirectionEngine {
         let receiver = thread::Builder::new()
             .name(format!("NetConditioner-{display}-recv"))
             .spawn(move || {
+                let _guard = ReceiverDoneGuard {
+                    done: receiver_done_guard,
+                    queue: receiver_queue.clone(),
+                };
                 receiver_loop(
                     display,
                     handle,
                     outbound,
                     &profile,
                     protocol,
-                    process_filter.as_ref(),
+                    process_filter.as_deref(),
                     max_queue_ns,
                     needs_queue,
                     base,
@@ -312,9 +390,11 @@ impl DirectionEngine {
         let sender_stop = stop.clone();
         let sender_queue = queue.clone();
         let sender_pool = pool.clone();
-        let sender_stats = stats.clone();
+        let sender_stats = stats;
         let sender_events = events;
         let sender_fault_reported = fault_reported;
+        let sender_receiver_done = receiver_done;
+        let bandwidth = self.profile.bandwidth_kbps.max(0) as u64;
         let sender = match thread::Builder::new()
             .name(format!("NetConditioner-{display}-send"))
             .spawn(move || {
@@ -322,10 +402,12 @@ impl DirectionEngine {
                     display,
                     handle,
                     base,
+                    bandwidth,
                     &sender_queue,
                     &sender_pool,
                     &sender_stats,
                     &sender_stop,
+                    &sender_receiver_done,
                     &sender_events,
                     &sender_fault_reported,
                 );
@@ -333,10 +415,13 @@ impl DirectionEngine {
             Ok(sender) => sender,
             Err(error) => {
                 stop.store(true, AtomicOrdering::Release);
+                // 先关闭接收，接收线程才能从 Recv 返回；否则 join 可能永久阻塞。
+                let _ = windivert::shutdown(handle, windivert::SHUTDOWN_RECV);
                 queue.1.notify_all();
                 let _ = receiver.join();
                 windivert::close(handle);
                 *self.handle.lock().unwrap() = None;
+                discard_all(&queue, &pool, &self.stats);
                 return Err(format!("启动{display}发送线程失败：{error}"));
             }
         };
@@ -356,9 +441,13 @@ impl DirectionEngine {
 
         // 停止期间保留 WinDivert 句柄，供发送线程重注入队列中的剩余包。
         {
-            let mut guard = self.handle.lock().unwrap();
+            let mut guard = match self.handle.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
             if let Some(handle) = *guard {
                 if !windivert::shutdown(handle, windivert::SHUTDOWN_RECV) {
+                    // 关闭句柄是关闭失败时的兜底，用于唤醒阻塞中的 Recv。
                     windivert::close(handle);
                     *guard = None;
                 }
@@ -374,19 +463,16 @@ impl DirectionEngine {
             let _ = handle.join();
         }
 
-        let handle = self.handle.lock().unwrap().take();
+        let handle = match self.handle.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        };
         if let Some(handle) = handle {
             windivert::close(handle);
         }
 
-        // 兜底清空队列（发送线程正常退出时已经清空）。
-        let mut guard = self.queue.0.lock().unwrap();
-        while let Some(item) = guard.heap.pop() {
-            guard.bytes = guard.bytes.saturating_sub(item.item.length);
-            return_item(&self.pool, item.item);
-        }
-        self.stats.set_queue(0);
-
+        // 发送线程异常退出时，剩余包也必须计入丢弃数。
+        discard_all(&self.queue, &self.pool, &self.stats);
         self.started = false;
     }
 }
@@ -418,11 +504,44 @@ fn report_fault(
     fault_reported: &AtomicBool,
     message: String,
 ) {
-    let _ = display;
     if fault_reported.swap(true, AtomicOrdering::AcqRel) {
         return;
     }
-    events.send(EngineEvent::Fault(message));
+    events.send(EngineEvent::Fault(format!("{display}：{message}")));
+}
+
+struct FailureReporter<'a> {
+    display: &'a str,
+    handle: isize,
+    stats: &'a DirectionStats,
+    events: &'a Arc<EngineEvents>,
+    fault_reported: &'a AtomicBool,
+}
+
+impl FailureReporter<'_> {
+    fn fail(&self, message: String) {
+        if self.stats.mark_failed() {
+            report_fault(self.display, self.events, self.fault_reported, message);
+        }
+        // 直通和排队发送共用同一种失败策略：停止继续接收。
+        let _ = windivert::shutdown(self.handle, windivert::SHUTDOWN_RECV);
+    }
+
+    fn send(&self, packet: *const u8, length: u32, address: *const u8) -> bool {
+        match windivert::send(self.handle, packet, length, address) {
+            Ok(_) => {
+                self.stats.add_sent();
+                true
+            }
+            Err(code) => {
+                self.stats.add_dropped();
+                self.fail(format!(
+                    "发送数据包失败（Win32 错误 {code}）。弱网模拟已停止。"
+                ));
+                false
+            }
+        }
+    }
 }
 
 fn rent_item(pool: &Arc<Mutex<Vec<PacketItem>>>) -> PacketItem {
@@ -440,25 +559,6 @@ fn return_item(pool: &Arc<Mutex<Vec<PacketItem>>>, mut item: PacketItem) {
     if let Ok(mut guard) = pool.lock() {
         if guard.len() < POOL_LIMIT {
             guard.push(item);
-            return;
-        }
-    }
-}
-
-fn send_direct(
-    handle: isize,
-    packet: *const u8,
-    length: u32,
-    address: *const u8,
-    stats: &DirectionStats,
-    stop: &AtomicBool,
-) {
-    match windivert::send(handle, packet, length, address) {
-        Ok(_) => stats.add_sent(),
-        Err(_) => {
-            if !stop.load(AtomicOrdering::Acquire) {
-                stats.add_dropped();
-            }
         }
     }
 }
@@ -470,7 +570,7 @@ fn receiver_loop(
     outbound: bool,
     profile: &DirectionProfile,
     protocol: ConditionProtocol,
-    process_filter: Option<&Arc<ProcessFlowFilter>>,
+    process_filter: Option<&ProcessFlowFilter>,
     max_queue_ns: u64,
     needs_queue: bool,
     base: Instant,
@@ -483,33 +583,45 @@ fn receiver_loop(
 ) {
     let mut packet = vec![0u8; windivert::MAX_PACKET_SIZE];
     let mut address = AlignedAddress([0u8; windivert::ADDRESS_BUFFER_SIZE]);
-    let mut burst = BurstLossState::new(
+    let burst = BurstLossState::new(
         profile.burst_allow_ms,
         profile.burst_drop_ms,
         elapsed_ns(base),
     );
-    let mut next_send_ns: u64 = 0;
+    let mut scheduler = BandwidthScheduler::new();
     let mut sequence: u64 = 0;
+    let reporter = FailureReporter {
+        display,
+        handle,
+        stats,
+        events,
+        fault_reported,
+    };
+    let queue_context = QueueContext { pool, queue, stats };
 
     let delay_ms = profile.delay_ms.max(0) as u64;
     let jitter_ms = profile.jitter_ms.max(0) as u64;
     let bandwidth = profile.bandwidth_kbps.max(0) as u64;
     let loss_percent = profile.random_loss_percent.clamp(0, 100) as u32;
 
-    while !stop.load(AtomicOrdering::Acquire) {
+    loop {
+        if stats.failed() {
+            break;
+        }
+
         let length = match windivert::recv(handle, packet.as_mut_ptr(), address.0.as_mut_ptr()) {
             Ok(length) => length,
             Err(code) => {
-                if stop.load(AtomicOrdering::Acquire) {
+                if code == ERROR_NO_DATA && stop.load(AtomicOrdering::Acquire) {
                     break;
                 }
-                report_fault(
-                    display,
-                    events,
-                    fault_reported,
-                    format!("{display}接收数据包失败（Win32 错误 {code}）。弱网模拟已停止。"),
-                );
-                return;
+                if stats.failed() || stop.load(AtomicOrdering::Acquire) {
+                    break;
+                }
+                reporter.fail(format!(
+                    "接收数据包失败（Win32 错误 {code}）。弱网模拟已停止。"
+                ));
+                break;
             }
         };
 
@@ -519,69 +631,50 @@ fn receiver_loop(
 
         // 只有按进程过滤或非 ALL 协议时，才需要解析每个包。
         if protocol != ConditionProtocol::All || process_filter.is_some() {
-            let parsed = crate::engine::flow::parse(&packet[..length as usize], outbound);
+            let parsed = crate::engine::flow::parse_packet(&packet[..length as usize], outbound);
             let protocol_value: u8;
-            let mut local: Option<FlowEndpoint> = None;
-
             match parsed {
-                Some((value, endpoint)) => {
-                    protocol_value = value;
-                    local = Some(endpoint);
+                Some(flow) => {
+                    protocol_value = flow.protocol;
+                    if !protocol_matches(protocol, protocol_value) {
+                        if !reporter.send(packet.as_ptr(), length, address.0.as_ptr()) {
+                            break;
+                        }
+                        continue;
+                    }
+                    if let Some(filter) = process_filter {
+                        if !filter.is_match_flow(protocol_value, flow.local, Some(flow.remote)) {
+                            if !reporter.send(packet.as_ptr(), length, address.0.as_ptr()) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                 }
                 None => {
                     if process_filter.is_some() {
-                        // 解析不了的包（如少见的 IPv6 扩展头）无法归属进程，直接放行。
-                        send_direct(
-                            handle,
-                            packet.as_ptr(),
-                            length,
-                            address.0.as_ptr(),
-                            stats,
-                            stop,
-                        );
+                        // 解析不了的包无法归属进程，直接放行。
+                        if !reporter.send(packet.as_ptr(), length, address.0.as_ptr()) {
+                            break;
+                        }
                         continue;
                     }
 
                     match windivert::parse_protocol(packet.as_ptr(), length) {
                         Some(value) => protocol_value = value,
                         None => {
-                            send_direct(
-                                handle,
-                                packet.as_ptr(),
-                                length,
-                                address.0.as_ptr(),
-                                stats,
-                                stop,
-                            );
+                            if !reporter.send(packet.as_ptr(), length, address.0.as_ptr()) {
+                                break;
+                            }
                             continue;
                         }
                     }
-                }
-            }
-
-            if !protocol_matches(protocol, protocol_value) {
-                send_direct(
-                    handle,
-                    packet.as_ptr(),
-                    length,
-                    address.0.as_ptr(),
-                    stats,
-                    stop,
-                );
-                continue;
-            }
-
-            if let (Some(filter), Some(endpoint)) = (process_filter, local) {
-                if !filter.is_match(protocol_value, endpoint) {
-                    send_direct(
-                        handle,
-                        packet.as_ptr(),
-                        length,
-                        address.0.as_ptr(),
-                        stats,
-                        stop,
-                    );
-                    continue;
+                    if !protocol_matches(protocol, protocol_value) {
+                        if !reporter.send(packet.as_ptr(), length, address.0.as_ptr()) {
+                            break;
+                        }
+                        continue;
+                    }
                 }
             }
         }
@@ -598,14 +691,9 @@ fn receiver_loop(
         }
 
         if !needs_queue {
-            send_direct(
-                handle,
-                packet.as_ptr(),
-                length,
-                address.0.as_ptr(),
-                stats,
-                stop,
-            );
+            if !reporter.send(packet.as_ptr(), length, address.0.as_ptr()) {
+                break;
+            }
             continue;
         }
 
@@ -614,82 +702,124 @@ fn receiver_loop(
         } else {
             0
         };
-        let intended_delay_ns = (delay_ms + jitter) * 1_000_000;
-        let mut due = now + intended_delay_ns;
-
-        if bandwidth > 0 {
-            // 串行化发送：每个包按自身长度累加发送时间并排队。
-            let length = length as u64;
-            let packet_ns = ((length * 8 * 1_000_000_000) / (bandwidth * 1000)).max(1);
-            let start = due.max(next_send_ns);
-            next_send_ns = start + packet_ns;
-            due = next_send_ns;
-        }
-
-        // 只限制“超出用户配置延时之外的额外排队”。
-        if max_queue_ns > 0 && due.saturating_sub(now + intended_delay_ns) > max_queue_ns {
+        let intended_delay_ns = delay_ms.saturating_add(jitter).saturating_mul(1_000_000);
+        let Some(plan) = scheduler.plan(
+            now,
+            intended_delay_ns,
+            length as usize,
+            bandwidth,
+            max_queue_ns,
+        ) else {
             stats.add_dropped();
             continue;
-        }
+        };
 
         sequence += 1;
-        enqueue(
-            pool,
-            queue,
-            stats,
+        if queue_context.enqueue(
             &packet[..length as usize],
             &address.0,
-            due,
+            plan.due_ns,
+            plan.expires_ns,
             sequence,
-        );
+        ) {
+            // 只有成功入队才消耗未来带宽；队列满/超限的包不会留下时间债。
+            scheduler.commit(plan);
+        } else {
+            stats.add_dropped();
+        }
     }
-
-    // 唤醒发送线程，让它把队列里剩余的包重注入后退出。
-    queue.1.notify_all();
 }
 
-fn enqueue(
-    pool: &Arc<Mutex<Vec<PacketItem>>>,
+struct QueueContext<'a> {
+    pool: &'a Arc<Mutex<Vec<PacketItem>>>,
+    queue: &'a Arc<(Mutex<QueueState>, Condvar)>,
+    stats: &'a Arc<DirectionStats>,
+}
+
+impl QueueContext<'_> {
+    fn enqueue(
+        &self,
+        data: &[u8],
+        address: &[u8],
+        due_ns: u64,
+        expires_ns: u64,
+        sequence: u64,
+    ) -> bool {
+        let mut item = rent_item(self.pool);
+        item.data.extend_from_slice(data);
+        item.address
+            .copy_from_slice(&address[..windivert::ADDRESS_STRUCT_SIZE]);
+        item.length = data.len();
+        item.due_ns = due_ns;
+        item.expires_ns = expires_ns;
+        item.sequence = sequence;
+
+        let mut guard = match self.queue.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if guard.heap.len() >= MAX_QUEUE_PACKETS || guard.bytes + item.length > MAX_QUEUE_BYTES {
+            drop(guard);
+            return_item(self.pool, item);
+            return false;
+        }
+
+        let old_head_due = guard.heap.peek().map(|head| head.due_ns);
+        guard.bytes += item.length;
+        guard.heap.push(QueuedItem {
+            due_ns,
+            sequence,
+            item,
+        });
+        self.stats.set_queue(guard.heap.len());
+
+        // 仅在新包会成为更早的队首，或队列为空时唤醒发送线程。
+        if old_head_due.is_none_or(|head| due_ns < head) {
+            self.queue.1.notify_one();
+        }
+        true
+    }
+}
+
+fn wait_until(
+    base: Instant,
+    target_ns: u64,
     queue: &Arc<(Mutex<QueueState>, Condvar)>,
-    stats: &Arc<DirectionStats>,
-    data: &[u8],
-    address: &[u8],
-    due_ns: u64,
-    sequence: u64,
+    stop: &AtomicBool,
+    stats: &DirectionStats,
 ) {
-    let mut item = rent_item(pool);
-    item.data.extend_from_slice(data);
-    item.address
-        .copy_from_slice(&address[..windivert::ADDRESS_STRUCT_SIZE]);
-    item.length = data.len();
-    item.due_ns = due_ns;
-    item.sequence = sequence;
-
-    let mut guard = match queue.0.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-
-    if guard.heap.len() >= MAX_QUEUE_PACKETS || guard.bytes + item.length > MAX_QUEUE_BYTES {
-        drop(guard);
-        stats.add_dropped();
-        return_item(pool, item);
-        return;
+    loop {
+        if stop.load(AtomicOrdering::Acquire) || stats.failed() {
+            return;
+        }
+        let now = elapsed_ns(base);
+        if now >= target_ns {
+            return;
+        }
+        let wait = Duration::from_nanos(target_ns - now).min(WAIT_SLICE);
+        let guard = match queue.0.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let (next, _) = match queue.1.wait_timeout(guard, wait) {
+            Ok(pair) => pair,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        drop(next);
     }
+}
 
-    let old_head_due = guard.heap.peek().map(|head| head.due_ns);
-    guard.bytes += item.length;
-    guard.heap.push(QueuedItem {
-        due_ns,
-        sequence,
-        item,
-    });
-    stats.set_queue(guard.heap.len());
-
-    // 仅在新包会成为更早的队首，或队列为空时唤醒发送线程。
-    if old_head_due.map_or(true, |head| due_ns < head) {
-        queue.1.notify_one();
+fn paced_send_time(due_ns: u64, last_send_end_ns: Option<u64>, now_ns: u64) -> u64 {
+    let mut send_at = due_ns;
+    if let Some(last_end) = last_send_end_ns {
+        send_at = send_at.max(last_end);
     }
+    if send_at < now_ns {
+        // 发送线程曾经停顿：以当前实际进度重新锚定，避免把积压包突发出去。
+        send_at = now_ns;
+    }
+    send_at
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -697,120 +827,145 @@ fn sender_loop(
     display: &str,
     handle: isize,
     base: Instant,
+    bandwidth_kbps: u64,
     queue: &Arc<(Mutex<QueueState>, Condvar)>,
     pool: &Arc<Mutex<Vec<PacketItem>>>,
     stats: &Arc<DirectionStats>,
     stop: &AtomicBool,
+    receiver_done: &Arc<AtomicBool>,
     events: &Arc<EngineEvents>,
     fault_reported: &AtomicBool,
 ) {
+    let reporter = FailureReporter {
+        display,
+        handle,
+        stats,
+        events,
+        fault_reported,
+    };
+    let mut last_send_end_ns: Option<u64> = None;
+
     loop {
         let mut guard = match queue.0.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let stopping = stop.load(AtomicOrdering::Acquire);
+        let failed = stats.failed();
 
-        let ready = loop {
-            let stopping = stop.load(AtomicOrdering::Acquire);
-            match guard.heap.peek() {
-                Some(head) => {
-                    let now = elapsed_ns(base);
-                    if stopping || head.due_ns <= now {
-                        break true;
-                    }
-                    let wait =
-                        Duration::from_nanos(head.due_ns - now).min(Duration::from_millis(100));
-                    let (next, _) = match queue.1.wait_timeout(guard, wait) {
-                        Ok(pair) => pair,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    guard = next;
-                }
-                None => {
-                    if stopping {
-                        break false;
-                    }
-                    let (next, _) = match queue.1.wait_timeout(guard, Duration::from_millis(100)) {
-                        Ok(pair) => pair,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    guard = next;
-                }
-            }
-        };
+        if stopping || failed {
+            if let Some(queued) = guard.heap.pop() {
+                guard.bytes = guard.bytes.saturating_sub(queued.item.length);
+                stats.set_queue(guard.heap.len());
+                drop(guard);
 
-        let mut batch: Vec<PacketItem> = Vec::with_capacity(SEND_BATCH_SIZE);
-        if ready {
-            let now = elapsed_ns(base);
-            while batch.len() < SEND_BATCH_SIZE {
-                let take = match guard.heap.peek() {
-                    Some(head) => stop.load(AtomicOrdering::Acquire) || head.due_ns <= now,
-                    None => false,
-                };
-                if !take {
-                    break;
+                if failed {
+                    stats.add_dropped();
+                } else if !reporter.send(
+                    queued.item.data.as_ptr(),
+                    queued.item.length as u32,
+                    queued.item.address.as_ptr(),
+                ) {
+                    // 失败包已在 FailureReporter::send 中计数。
                 }
-                if let Some(queued) = guard.heap.pop() {
-                    guard.bytes = guard.bytes.saturating_sub(queued.item.length);
-                    batch.push(queued.item);
-                }
-            }
-            stats.set_queue(guard.heap.len());
-        }
-        drop(guard);
-
-        if batch.is_empty() {
-            if stop.load(AtomicOrdering::Acquire) {
-                break;
-            }
-            continue;
-        }
-
-        let mut send_failed = false;
-        for item in batch {
-            if send_failed {
-                return_item(pool, item);
+                return_item(pool, queued.item);
                 continue;
             }
 
-            match windivert::send(
-                handle,
-                item.data.as_ptr(),
-                item.length as u32,
-                item.address.as_ptr(),
-            ) {
-                Ok(_) => stats.add_sent(),
-                Err(code) => {
-                    if !stop.load(AtomicOrdering::Acquire) {
-                        stats.add_dropped();
-                        report_fault(
-                            display,
-                            events,
-                            fault_reported,
-                            format!(
-                                "{display}发送数据包失败（Win32 错误 {code}）。弱网模拟已停止。"
-                            ),
-                        );
-                        send_failed = true;
-                    }
-                }
+            if receiver_done.load(AtomicOrdering::Acquire) {
+                break;
             }
-
-            return_item(pool, item);
+            drop(guard);
+            let guard = match queue.0.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let (next, _) = match queue.1.wait_timeout(guard, WAIT_SLICE) {
+                Ok(pair) => pair,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            drop(next);
+            continue;
         }
 
-        if send_failed {
-            break;
+        let now = elapsed_ns(base);
+        let action = match guard.heap.peek() {
+            Some(head) if head.item.expires_ns > 0 && now > head.item.expires_ns => 1,
+            Some(head) if head.due_ns > now => 2,
+            Some(_) => 3,
+            None if receiver_done.load(AtomicOrdering::Acquire) => 0,
+            None => 2,
+        };
+
+        match action {
+            0 => break,
+            1 => {
+                let queued = guard.heap.pop().unwrap();
+                guard.bytes = guard.bytes.saturating_sub(queued.item.length);
+                stats.set_queue(guard.heap.len());
+                drop(guard);
+                stats.add_dropped();
+                return_item(pool, queued.item);
+            }
+            2 => {
+                let wait = guard
+                    .heap
+                    .peek()
+                    .map(|head| Duration::from_nanos(head.due_ns.saturating_sub(now)))
+                    .unwrap_or(WAIT_SLICE)
+                    .min(WAIT_SLICE);
+                let (next, _) = match queue.1.wait_timeout(guard, wait) {
+                    Ok(pair) => pair,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                drop(next);
+            }
+            _ => {
+                let queued = guard.heap.pop().unwrap();
+                guard.bytes = guard.bytes.saturating_sub(queued.item.length);
+                stats.set_queue(guard.heap.len());
+                drop(guard);
+
+                let packet_ns = packet_service_ns(queued.item.length, bandwidth_kbps);
+                let mut send_at = queued.item.due_ns;
+                if bandwidth_kbps > 0 {
+                    send_at = paced_send_time(send_at, last_send_end_ns, elapsed_ns(base));
+                }
+                wait_until(base, send_at, queue, stop, stats);
+
+                let stopping = stop.load(AtomicOrdering::Acquire);
+                let failed = stats.failed();
+                let expired = !stopping
+                    && queued.item.expires_ns > 0
+                    && elapsed_ns(base) > queued.item.expires_ns;
+                if failed || expired {
+                    stats.add_dropped();
+                } else if reporter.send(
+                    queued.item.data.as_ptr(),
+                    queued.item.length as u32,
+                    queued.item.address.as_ptr(),
+                ) && bandwidth_kbps > 0
+                {
+                    last_send_end_ns = Some(send_at.saturating_add(packet_ns));
+                }
+                return_item(pool, queued.item);
+            }
         }
     }
+}
 
-    // 退出前清空队列。
+fn discard_all(
+    queue: &Arc<(Mutex<QueueState>, Condvar)>,
+    pool: &Arc<Mutex<Vec<PacketItem>>>,
+    stats: &Arc<DirectionStats>,
+) {
     let mut guard = match queue.0.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     while let Some(queued) = guard.heap.pop() {
         guard.bytes = guard.bytes.saturating_sub(queued.item.length);
+        stats.add_dropped();
         return_item(pool, queued.item);
     }
     stats.set_queue(0);
@@ -820,25 +975,68 @@ fn sender_loop(
 mod tests {
     use super::*;
 
+    fn engine_for_test() -> DirectionEngine {
+        let (sender, _receiver) = std::sync::mpsc::channel();
+        let events = Arc::new(EngineEvents::new(sender, Box::new(|| {})));
+        DirectionEngine::new(
+            "test",
+            "false",
+            true,
+            &DirectionProfile::default(),
+            ConditionProtocol::All,
+            None,
+            1000,
+            events,
+        )
+    }
+
     #[test]
-    fn burst_loss_state_machine() {
-        // 只放行。
-        let mut only_allow = BurstLossState::new(100, 0, 0);
+    fn burst_loss_state_handles_sparse_calls() {
+        let only_allow = BurstLossState::new(100, 0, 0);
         assert!(!only_allow.should_drop(0));
 
-        // 只丢包。
-        let mut only_drop = BurstLossState::new(0, 100, 0);
+        let only_drop = BurstLossState::new(0, 100, 0);
         assert!(only_drop.should_drop(0));
 
-        // 关闭。
-        let mut disabled = BurstLossState::new(0, 0, 0);
-        assert!(!disabled.should_drop(0));
+        let disabled = BurstLossState::new(0, 0, 0);
+        assert!(!disabled.should_drop(u64::MAX));
 
-        // 放行 100ms → 丢包 100ms → 放行…
-        let mut cycling = BurstLossState::new(100, 100, 0);
+        let cycling = BurstLossState::new(100, 100, 0);
         assert!(!cycling.should_drop(50_000_000));
         assert!(cycling.should_drop(150_000_000));
         assert!(!cycling.should_drop(250_000_000));
+        // 一次跳过多个完整阶段后仍应落在正确阶段。
+        assert!(cycling.should_drop(1_350_000_000));
+        assert!(!cycling.should_drop(1_450_000_000));
+    }
+
+    #[test]
+    fn rejected_packet_does_not_consume_future_bandwidth() {
+        let mut scheduler = BandwidthScheduler::new();
+        let first = scheduler.plan(0, 0, 1000, 8, 0).unwrap();
+        let retry = scheduler.plan(0, 0, 1000, 8, 0).unwrap();
+        assert_eq!(first.due_ns, retry.due_ns);
+
+        scheduler.commit(retry);
+        let next = scheduler.plan(0, 0, 1000, 8, 0).unwrap();
+        assert_eq!(next.due_ns, retry.due_ns + packet_service_ns(1000, 8));
+    }
+
+    #[test]
+    fn scheduler_enforces_extra_queue_latency() {
+        let scheduler = BandwidthScheduler::new();
+        assert!(scheduler.plan(0, 0, 1000, 1, 1).is_none());
+        let plan = scheduler.plan(0, 0, 100, 1_000_000, 1_000_000).unwrap();
+        assert!(plan.expires_ns > 0);
+    }
+
+    #[test]
+    fn actual_send_pacing_rebases_after_stall() {
+        let service = packet_service_ns(1000, 8);
+        let first = paced_send_time(10, None, 100);
+        assert_eq!(first, 100);
+        let second = paced_send_time(10, Some(first + service), 100);
+        assert_eq!(second, first + service);
     }
 
     #[test]
@@ -854,5 +1052,62 @@ mod tests {
         assert_eq!(heap.pop().unwrap().due_ns, 10);
         assert_eq!(heap.pop().unwrap().due_ns, 20);
         assert_eq!(heap.pop().unwrap().due_ns, 30);
+    }
+
+    #[test]
+    fn discard_all_counts_every_leftover() {
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                heap: BinaryHeap::new(),
+                bytes: 0,
+            }),
+            Condvar::new(),
+        ));
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let stats = Arc::new(DirectionStats::new());
+        let queue_context = QueueContext {
+            pool: &pool,
+            queue: &queue,
+            stats: &stats,
+        };
+        for sequence in 0..3 {
+            assert!(queue_context.enqueue(
+                &[1, 2, 3],
+                &[0u8; windivert::ADDRESS_BUFFER_SIZE],
+                sequence,
+                0,
+                sequence,
+            ));
+        }
+        discard_all(&queue, &pool, &stats);
+        assert_eq!(stats.dropped(), 3);
+        assert_eq!(stats.queue_count(), 0);
+    }
+
+    #[test]
+    fn receiver_done_guard_publishes_completion() {
+        let done = Arc::new(AtomicBool::new(false));
+        let queue = Arc::new((
+            Mutex::new(QueueState {
+                heap: BinaryHeap::new(),
+                bytes: 0,
+            }),
+            Condvar::new(),
+        ));
+        {
+            let _guard = ReceiverDoneGuard {
+                done: done.clone(),
+                queue: queue.clone(),
+            };
+            assert!(!done.load(AtomicOrdering::Acquire));
+        }
+        assert!(done.load(AtomicOrdering::Acquire));
+    }
+
+    #[test]
+    fn direction_engine_rejects_restart_before_opening_windivert() {
+        let mut engine = engine_for_test();
+        engine.start_attempted = true;
+        assert!(engine.start().unwrap_err().contains("只能启动一次"));
     }
 }

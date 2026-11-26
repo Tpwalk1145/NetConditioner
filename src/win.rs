@@ -427,6 +427,39 @@ pub fn last_error_code() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
+pub fn child_windows(hwnd: HWND) -> Vec<HWND> {
+    unsafe {
+        let mut children = Vec::new();
+        let mut child = GetWindow(hwnd, GW_CHILD);
+        while !child.is_null() {
+            children.push(child);
+            child = GetWindow(child, GW_HWNDNEXT);
+        }
+        children
+    }
+}
+
+pub fn fit_dialog_scale(owner: HWND, base_width: i32, base_height: i32, preferred: f64) -> f64 {
+    unsafe {
+        let monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTOPRIMARY);
+        let mut info: MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) == 0 {
+            return preferred;
+        }
+        let work = info.rcWork;
+        let width = (work.right - work.left - 32).max(1);
+        let height = (work.bottom - work.top - 32).max(1);
+        let fit = (f64::from(width) / f64::from(base_width.max(1)))
+            .min(f64::from(height) / f64::from(base_height.max(1)));
+        preferred.min(fit).max(0.5)
+    }
+}
+
+pub fn parent_hwnd(hwnd: HWND) -> HWND {
+    unsafe { GetParent(hwnd) }
+}
+
 /// 居中到父窗口。
 pub fn center_on_owner(hwnd: HWND, owner: HWND) {
     if owner.is_null() {
@@ -549,7 +582,7 @@ pub fn create_circle_icon(color: u32, size: i32) -> HICON {
 
         // GDI 不会写入 alpha 通道，这里把非黑色像素标为不透明。
         let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             if pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0 {
                 pixel[3] = 255;
             }
@@ -603,10 +636,10 @@ pub fn unregister_hotkey(hwnd: HWND, id: i32) {
 
 pub fn is_elevated() -> bool {
     unsafe {
-        let mut authority = SECURITY_NT_AUTHORITY;
+        let authority = SECURITY_NT_AUTHORITY;
         let mut administrators: PSID = std::ptr::null_mut();
         let created = AllocateAndInitializeSid(
-            &mut authority,
+            &authority,
             2u8,
             0x20,  // SECURITY_BUILTIN_DOMAIN_RID
             0x220, // DOMAIN_ALIAS_RID_ADMINS
@@ -646,11 +679,11 @@ pub fn create_single_instance_mutex() -> Option<HANDLE> {
 
 pub fn init_common_controls() {
     unsafe {
-        let mut info = INITCOMMONCONTROLSEX {
+        let info = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_LISTVIEW_CLASSES | ICC_UPDOWN_CLASS | ICC_STANDARD_CLASSES,
         };
-        InitCommonControlsEx(&mut info);
+        InitCommonControlsEx(&info);
     }
 }
 
@@ -664,6 +697,20 @@ pub fn is_remote_session() -> bool {
     unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
 }
 
+pub fn set_dc_brush_color(hdc: HDC, color: u32) {
+    unsafe {
+        SetDCBrushColor(hdc, color);
+    }
+}
+
+pub fn dc_brush() -> HBRUSH {
+    unsafe { GetStockObject(DC_BRUSH) as HBRUSH }
+}
+
+pub fn is_window_enabled(hwnd: HWND) -> bool {
+    unsafe { GetWindowLongW(hwnd, GWL_STYLE) as u32 & WS_DISABLED == 0 }
+}
+
 pub fn set_cue_banner(edit: HWND, text: &str) {
     let text = wide(text);
     send(edit, EM_SETCUEBANNER, 1, text.as_ptr() as isize);
@@ -673,7 +720,38 @@ pub fn write_fixed(buffer: &mut [u16], text: &str) {
     for slot in buffer.iter_mut() {
         *slot = 0;
     }
-    for (slot, code) in buffer.iter_mut().zip(text.encode_utf16()) {
+    let Some(last) = buffer.len().checked_sub(1) else {
+        return;
+    };
+    for (slot, code) in buffer.iter_mut().take(last).zip(text.encode_utf16()) {
         *slot = code;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_fixed;
+
+    #[test]
+    fn fixed_buffers_always_keep_a_terminator() {
+        let mut buffer = [0u16; 5];
+        write_fixed(&mut buffer, "abcd");
+        assert_eq!(
+            &buffer,
+            &[b'a' as u16, b'b' as u16, b'c' as u16, b'd' as u16, 0]
+        );
+
+        write_fixed(&mut buffer, "abcdef");
+        assert_eq!(
+            &buffer,
+            &[b'a' as u16, b'b' as u16, b'c' as u16, b'd' as u16, 0]
+        );
+
+        write_fixed(&mut buffer, "😀");
+        assert_eq!(buffer[0], 0xD83D);
+        assert_eq!(buffer[1], 0xDE00);
+        assert_eq!(buffer[2], 0);
+
+        write_fixed(&mut [], "ignored");
     }
 }

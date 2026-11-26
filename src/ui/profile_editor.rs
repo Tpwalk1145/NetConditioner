@@ -1,18 +1,19 @@
 //! 配置编辑对话框。
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::app::{App, Dialog};
+use crate::app::App;
 use crate::config::{self, ConditionProtocol, DirectionProfile, NetworkProfile};
 use crate::ui::ids;
 use crate::ui::widgets::{
-    self, Align, FontRole, NumberInput, CARD, DANGER_BG, DANGER_BORDER, DANGER_TEXT, TEXT_BUTTON,
-    TEXT_DARK, TEXT_MUTED,
+    self, Align, FontRole, Fonts, NumberInput, CARD, DANGER_BG, DANGER_BORDER, DANGER_TEXT,
+    TEXT_BUTTON, TEXT_DARK, TEXT_MUTED,
 };
 use crate::win;
 
@@ -34,10 +35,15 @@ pub struct ProfileEditor {
     up: Vec<NumberInput>,
     down: Vec<NumberInput>,
     protocol_combo: HWND,
-    outcome: Option<EditorOutcome>,
+    fonts: Rc<Fonts>,
+    pub outcome: Option<EditorOutcome>,
 }
 
 impl ProfileEditor {
+    pub fn fonts(&self) -> &Fonts {
+        &self.fonts
+    }
+
     pub fn create(
         app: &mut App,
         existing: Option<&NetworkProfile>,
@@ -45,8 +51,9 @@ impl ProfileEditor {
         existing_names: HashSet<String>,
     ) -> Self {
         let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
-        let scale = app.main.as_ref().map(|main| main.scale).unwrap_or(1.0);
-        let fonts = &app.fonts;
+        let preferred_scale = app.main.as_ref().map(|main| main.scale).unwrap_or(1.0);
+        let scale = win::fit_dialog_scale(owner, CLIENT_WIDTH, CLIENT_HEIGHT, preferred_scale);
+        let fonts = Rc::new(Fonts::new((scale * 96.0).round() as u32));
         let s = |value: i32| (value as f64 * scale).round() as i32;
 
         let title = if existing.is_some() {
@@ -178,10 +185,10 @@ impl ProfileEditor {
                 hwnd,
                 ids::EDITOR_ROW_LABEL_BASE + row,
                 up_labels[row],
-                20 + 14,
-                y + 4,
-                150,
-                20,
+                s(20 + 14),
+                s(y + 4),
+                s(150),
+                s(20),
                 FontRole::Body,
                 TEXT_BUTTON,
                 widgets::SURFACE,
@@ -206,10 +213,10 @@ impl ProfileEditor {
                 hwnd,
                 ids::EDITOR_ROW_LABEL_BASE + 10 + row,
                 down_labels[row],
-                390 + 14,
-                y + 4,
-                150,
-                20,
+                s(390 + 14),
+                s(y + 4),
+                s(150),
+                s(20),
                 FontRole::Body,
                 TEXT_BUTTON,
                 widgets::SURFACE,
@@ -338,6 +345,7 @@ impl ProfileEditor {
             up,
             down,
             protocol_combo,
+            fonts,
             outcome: None,
         };
         editor.load_values(existing);
@@ -398,12 +406,20 @@ impl ProfileEditor {
                 win::set_text_color(wparam as HDC, TEXT_DARK);
                 Some(app.white_brush as isize)
             }
+            WM_CTLCOLORBTN => {
+                let hwnd = lparam as HWND;
+                app.button_colors(hwnd).map(|(background, foreground)| {
+                    win::set_dc_brush_color(wparam as HDC, background);
+                    win::set_text_color(wparam as HDC, foreground);
+                    win::dc_brush() as isize
+                })
+            }
             WM_COMMAND => {
-                let id = (wparam & 0xFFFF) as usize;
+                let id = wparam & 0xFFFF;
                 let code = ((wparam >> 16) & 0xFFFF) as u32;
                 match id {
                     ids::EDITOR_OK => self.confirm(app),
-                    ids::EDITOR_CANCEL => self.close(),
+                    ids::EDITOR_CANCEL => self.close(app),
                     ids::EDITOR_DELETE if code == BN_CLICKED => self.delete(app),
                     _ => {
                         if code == EN_KILLFOCUS {
@@ -431,7 +447,7 @@ impl ProfileEditor {
                 Some(0)
             }
             WM_CLOSE => {
-                self.close();
+                self.close(app);
                 Some(0)
             }
             WM_DESTROY => {
@@ -442,8 +458,9 @@ impl ProfileEditor {
         }
     }
 
-    pub fn close(&mut self) {
+    pub fn close(&mut self, app: &mut App) {
         self.closed = true;
+        app.cleanup_dialog_widgets(self.hwnd);
         win::destroy(self.hwnd);
     }
 
@@ -496,6 +513,22 @@ impl ProfileEditor {
             return;
         }
 
+        if let Some(edit) = self
+            .up
+            .iter()
+            .chain(self.down.iter())
+            .find(|number| !number.is_valid())
+            .map(|number| number.edit)
+        {
+            app.show_message(
+                "请输入有效的非负整数，不要输入单位或小数。",
+                "配置无效",
+                MB_OK | MB_ICONWARNING,
+            );
+            win::set_focus(edit);
+            return;
+        }
+
         let protocol = match win::send(self.protocol_combo, CB_GETCURSEL, 0, 0) {
             0 => ConditionProtocol::Tcp,
             1 => ConditionProtocol::Udp,
@@ -531,7 +564,7 @@ impl ProfileEditor {
         }
 
         self.outcome = Some(EditorOutcome::Saved(profile));
-        self.close();
+        self.close(app);
     }
 
     fn delete(&mut self, app: &mut App) {
@@ -544,7 +577,7 @@ impl ProfileEditor {
             return;
         }
         self.outcome = Some(EditorOutcome::Deleted);
-        self.close();
+        self.close(app);
     }
 }
 
@@ -560,32 +593,4 @@ fn make_default_name(existing: &HashSet<String>) -> String {
         }
     }
     format!("{base} {}", &config::new_id()[..6])
-}
-
-pub fn open(
-    app: &mut App,
-    existing: Option<&NetworkProfile>,
-    allow_delete: bool,
-) -> Option<EditorOutcome> {
-    let existing_id = existing
-        .map(|profile| profile.id.clone())
-        .unwrap_or_default();
-    let existing_names: HashSet<String> = app
-        .config
-        .profiles
-        .iter()
-        .filter(|profile| profile.id != existing_id)
-        .map(|profile| profile.name.to_lowercase())
-        .collect();
-
-    let editor = ProfileEditor::create(app, existing, allow_delete, existing_names);
-    let hwnd = editor.hwnd;
-    let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
-    app.dialog = Some(Dialog::Editor(editor));
-    win::run_modal(owner, hwnd);
-
-    match app.dialog.take() {
-        Some(Dialog::Editor(editor)) => editor.outcome,
-        _ => None,
-    }
 }

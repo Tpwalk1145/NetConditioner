@@ -1,16 +1,18 @@
 //! 目标进程选择对话框。
 
+use std::rc::Rc;
+
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::HDC;
 use windows_sys::Win32::UI::Controls::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::app::{App, Dialog};
+use crate::app::App;
 use crate::config::MAX_PROCESS_COUNT;
 use crate::engine::process_filter;
 use crate::ui::ids;
 use crate::ui::widgets::{
-    self, Align, FontRole, ListView, CARD, TEXT_BUTTON, TEXT_DARK, TEXT_MUTED,
+    self, Align, FontRole, Fonts, ListView, CARD, TEXT_BUTTON, TEXT_DARK, TEXT_MUTED,
 };
 use crate::win;
 
@@ -36,14 +38,20 @@ pub struct ProcessSelector {
     displayed: Vec<usize>,
     selected: Vec<String>,
     suppress: bool,
+    fonts: Rc<Fonts>,
     pub outcome: Option<Vec<String>>,
 }
 
 impl ProcessSelector {
+    pub fn fonts(&self) -> &Fonts {
+        &self.fonts
+    }
+
     pub fn create(app: &mut App) -> Self {
         let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
-        let scale = app.main.as_ref().map(|main| main.scale).unwrap_or(1.0);
-        let fonts = &app.fonts;
+        let preferred_scale = app.main.as_ref().map(|main| main.scale).unwrap_or(1.0);
+        let scale = win::fit_dialog_scale(owner, CLIENT_WIDTH, CLIENT_HEIGHT, preferred_scale);
+        let fonts = Rc::new(Fonts::new((scale * 96.0).round() as u32));
         let s = |value: i32| (value as f64 * scale).round() as i32;
 
         let hwnd = win::create_window(
@@ -238,6 +246,7 @@ impl ProcessSelector {
             displayed: Vec::new(),
             selected: Vec::new(),
             suppress: false,
+            fonts,
             outcome: None,
         };
 
@@ -387,8 +396,16 @@ impl ProcessSelector {
                 win::set_text_color(wparam as HDC, TEXT_DARK);
                 Some(app.white_brush as isize)
             }
+            WM_CTLCOLORBTN => {
+                let hwnd = lparam as HWND;
+                app.button_colors(hwnd).map(|(background, foreground)| {
+                    win::set_dc_brush_color(wparam as HDC, background);
+                    win::set_text_color(wparam as HDC, foreground);
+                    win::dc_brush() as isize
+                })
+            }
             WM_COMMAND => {
-                let id = (wparam & 0xFFFF) as usize;
+                let id = wparam & 0xFFFF;
                 let code = ((wparam >> 16) & 0xFFFF) as u32;
                 match id {
                     ids::SELECTOR_SEARCH if code == EN_CHANGE => self.rebuild(app),
@@ -396,7 +413,7 @@ impl ProcessSelector {
                     ids::SELECTOR_SELECT_ALL => self.select_all_visible(app),
                     ids::SELECTOR_CLEAR => self.clear_selection(app),
                     ids::SELECTOR_OK => self.confirm(app),
-                    ids::SELECTOR_CANCEL => self.close(),
+                    ids::SELECTOR_CANCEL => self.close(app),
                     _ => {}
                 }
                 Some(0)
@@ -456,7 +473,7 @@ impl ProcessSelector {
                 Some(0)
             }
             WM_CLOSE => {
-                self.close();
+                self.close(app);
                 Some(0)
             }
             WM_DESTROY => {
@@ -483,8 +500,9 @@ impl ProcessSelector {
         self.rebuild(app);
     }
 
-    pub fn close(&mut self) {
+    pub fn close(&mut self, app: &mut App) {
         self.closed = true;
+        app.cleanup_dialog_widgets(self.hwnd);
         win::destroy(self.hwnd);
     }
 
@@ -501,19 +519,6 @@ impl ProcessSelector {
         let mut names = self.selected.clone();
         names.sort_by_key(|name| name.to_lowercase());
         self.outcome = Some(names);
-        self.close();
-    }
-}
-
-pub fn open(app: &mut App) -> Option<Vec<String>> {
-    let selector = ProcessSelector::create(app);
-    let hwnd = selector.hwnd;
-    let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
-    app.dialog = Some(Dialog::Selector(selector));
-    win::run_modal(owner, hwnd);
-
-    match app.dialog.take() {
-        Some(Dialog::Selector(selector)) => selector.outcome,
-        _ => None,
+        self.close(app);
     }
 }

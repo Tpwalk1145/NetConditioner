@@ -7,7 +7,11 @@ use crate::update::{CheckStatus, UpdateService};
 use crate::version;
 
 pub fn run() -> i32 {
-    let log_path = std::env::temp_dir().join("NetConditioner-update-check.log");
+    let base = crate::config::store::absolute_env_dir("TEMP").unwrap_or_else(std::env::temp_dir);
+    let log_path = base.join(format!(
+        "NetConditioner-update-check-{}.log",
+        crate::config::new_id()
+    ));
     let mut lines: Vec<String> = Vec::new();
     let mut push = |text: String| {
         lines.push(format!(
@@ -72,8 +76,13 @@ pub fn run() -> i32 {
     }
 
     let text = lines.join("\r\n") + "\r\n";
-    if let Ok(mut file) = std::fs::File::create(&log_path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&log_path)
+    {
         let _ = file.write_all(text.as_bytes());
+        let _ = file.sync_all();
     }
 
     exit_code

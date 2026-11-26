@@ -69,6 +69,12 @@ pub struct Fonts {
     fonts: HashMap<FontRole, HFONT>,
 }
 
+impl Drop for Fonts {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
 impl Fonts {
     pub fn new(dpi: u32) -> Self {
         let mut fonts: HashMap<FontRole, HFONT> = HashMap::new();
@@ -150,6 +156,7 @@ pub struct Widget {
     pub kind: WidgetKind,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn create_panel(
     parent: HWND,
     id: usize,
@@ -223,7 +230,7 @@ pub fn create_text_full(
     let hwnd = win::create_child(
         parent,
         "STATIC",
-        "",
+        text,
         SS_OWNERDRAW | WS_CHILD | WS_VISIBLE,
         0,
         x,
@@ -266,7 +273,7 @@ pub fn create_button(
     link: bool,
     widgets: &mut HashMap<isize, Widget>,
 ) -> HWND {
-    let mut style = (BS_OWNERDRAW as u32) | WS_CHILD | WS_VISIBLE;
+    let mut style = (BS_PUSHBUTTON as u32) | WS_CHILD | WS_VISIBLE;
     if !link {
         style |= WS_TABSTOP;
     }
@@ -367,6 +374,7 @@ pub fn set_widget_text(widgets: &mut HashMap<isize, Widget>, hwnd: HWND, text: &
     if let Some(widget) = widgets.get_mut(&(hwnd as isize)) {
         if let WidgetKind::Text { text: stored, .. } = &mut widget.kind {
             *stored = text.to_string();
+            win::set_text(hwnd, text);
         }
     }
     win::invalidate(hwnd);
@@ -465,6 +473,14 @@ pub fn draw_item(dis: &DRAWITEMSTRUCT, widgets: &HashMap<isize, Widget>, fonts: 
             if let Some(border) = border {
                 win::frame_rect(dis.hDC, &dis.rcItem, *border);
             }
+            if (dis.itemState & ODS_FOCUS) != 0 {
+                let mut focus = dis.rcItem;
+                focus.left += 3;
+                focus.top += 3;
+                focus.right -= 3;
+                focus.bottom -= 3;
+                win::frame_rect(dis.hDC, &focus, win::rgb(33, 150, 243));
+            }
             let text = win::get_text(hwnd);
             let mut rect = dis.rcItem;
             win::draw_text(
@@ -520,7 +536,7 @@ impl NumberInput {
             parent,
             "msctls_updown32",
             "",
-            WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT,
+            WS_CHILD | WS_VISIBLE,
             0,
             x + edit_width,
             y,
@@ -528,7 +544,6 @@ impl NumberInput {
             height,
             id + 5000,
         );
-        win::send(updown, UDM_SETBUDDY, edit as usize, 0);
         win::send(updown, UDM_SETRANGE32, 0, max as isize);
 
         Self {
@@ -539,24 +554,28 @@ impl NumberInput {
         }
     }
 
+    pub fn parsed_value(&self) -> Option<i32> {
+        parse_number_input(&win::get_text(self.edit), self.max)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.parsed_value().is_some()
+    }
+
     pub fn value(&self) -> i32 {
-        let text = win::get_text(self.edit);
-        let cleaned: String = text.chars().filter(|c| c.is_ascii_digit()).collect();
-        let value: i32 = cleaned.parse().unwrap_or(0);
-        value.clamp(0, self.max)
+        self.parsed_value().unwrap_or(0)
     }
 
     pub fn set_value(&self, value: i32) {
         let value = value.clamp(0, self.max);
         win::send(self.updown, UDM_SETPOS32, 0, value as isize);
-        // UDS_SETBUDDYINT 会把数字写回 buddy；这里兜底一次，避免空值。
-        if win::get_text(self.edit).is_empty() {
-            win::set_text(self.edit, &format_number(value));
-        }
+        win::set_text(self.edit, &format_number(value));
     }
 
     pub fn clamp_and_set(&self) {
-        self.set_value(self.value());
+        if let Some(value) = self.parsed_value() {
+            self.set_value(value);
+        }
     }
 
     /// 处理 UDN_DELTAPOS：按各自步进调整并阻止默认的 ±1。
@@ -567,6 +586,29 @@ impl NumberInput {
         self.set_value(target);
         true
     }
+}
+
+fn parse_number_input(text: &str, max: i32) -> Option<i32> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(0);
+    }
+
+    let mut value = 0i128;
+    let mut too_large = false;
+    for byte in text.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        if !too_large {
+            value = value.saturating_mul(10) + i128::from(byte - b'0');
+            if value > i128::from(max) {
+                too_large = true;
+            }
+        }
+    }
+
+    Some(if too_large { max } else { value as i32 })
 }
 
 pub fn format_number(value: i32) -> String {
@@ -679,5 +721,24 @@ impl ListView {
 
     pub fn set_font(&self, font: HFONT) {
         win::set_font(self.hwnd, font);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_number_input;
+
+    #[test]
+    fn number_input_parses_complete_values_and_clamps_overflow() {
+        assert_eq!(parse_number_input("", 100), Some(0));
+        assert_eq!(parse_number_input(" 42 ", 100), Some(42));
+        assert_eq!(
+            parse_number_input("999999999999999999999999", 100),
+            Some(100)
+        );
+        assert_eq!(parse_number_input("-1", 100), None);
+        assert_eq!(parse_number_input("1.5", 100), None);
+        assert_eq!(parse_number_input("12ms", 100), None);
+        assert_eq!(parse_number_input("１２", 100), None);
     }
 }

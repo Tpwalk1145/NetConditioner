@@ -78,10 +78,7 @@ fn main() {
         );
     }));
 
-    let code = match std::panic::catch_unwind(app::run) {
-        Ok(code) => code,
-        Err(_) => 1,
-    };
+    let code = std::panic::catch_unwind(app::run).unwrap_or(1);
 
     let _ = _mutex;
     std::process::exit(code);

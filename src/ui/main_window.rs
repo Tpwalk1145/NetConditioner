@@ -14,9 +14,8 @@ use crate::win;
 pub const CLIENT_WIDTH: i32 = 560;
 pub const CLIENT_HEIGHT: i32 = 574;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct MainControls {
-    pub header: HWND,
     pub status_card: HWND,
     pub stats_card: HWND,
     pub profile_combo: HWND,
@@ -35,32 +34,6 @@ pub struct MainControls {
     pub status_detail: HWND,
     pub minimize_button: HWND,
     pub exit_button: HWND,
-}
-
-impl Default for MainControls {
-    fn default() -> Self {
-        Self {
-            header: std::ptr::null_mut(),
-            status_card: std::ptr::null_mut(),
-            stats_card: std::ptr::null_mut(),
-            profile_combo: std::ptr::null_mut(),
-            new_button: std::ptr::null_mut(),
-            edit_button: std::ptr::null_mut(),
-            delete_button: std::ptr::null_mut(),
-            process_box: std::ptr::null_mut(),
-            process_button: std::ptr::null_mut(),
-            toggle_button: std::ptr::null_mut(),
-            hotkey_label: std::ptr::null_mut(),
-            settings_link: std::ptr::null_mut(),
-            uplink_stats: std::ptr::null_mut(),
-            downlink_stats: std::ptr::null_mut(),
-            status_dot: std::ptr::null_mut(),
-            status_label: std::ptr::null_mut(),
-            status_detail: std::ptr::null_mut(),
-            minimize_button: std::ptr::null_mut(),
-            exit_button: std::ptr::null_mut(),
-        }
-    }
 }
 
 pub struct MainWindow {
@@ -85,10 +58,11 @@ impl MainWindow {
 
     pub fn new(hwnd: HWND) -> Self {
         let dpi = win::dpi_of(hwnd);
+        let scale = win::fit_dialog_scale(hwnd, CLIENT_WIDTH, CLIENT_HEIGHT, dpi as f64 / 96.0);
         Self {
             hwnd,
-            dpi,
-            scale: dpi as f64 / 96.0,
+            dpi: (scale * 96.0).round() as u32,
+            scale,
             controls: MainControls::default(),
         }
     }
@@ -97,8 +71,7 @@ impl MainWindow {
         let s = |value: i32| (value as f64 * self.scale).round() as i32;
         let parent = self.hwnd;
         let mut c = MainControls::default();
-
-        c.header = widgets::create_panel(
+        widgets::create_panel(
             parent,
             ids::MAIN_HEADER,
             0,

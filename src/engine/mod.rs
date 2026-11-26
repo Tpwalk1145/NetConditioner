@@ -42,28 +42,33 @@ pub struct StatsSnapshot {
     pub sent: u64,
     pub dropped: u64,
     pub queue: u32,
+    #[allow(dead_code)]
+    pub failed: bool,
 }
 
 struct Running {
     uplink: DirectionEngine,
     downlink: DirectionEngine,
-    #[allow(dead_code)]
     process_filter: Option<Arc<ProcessFlowFilter>>,
 }
 
 /// 组合上下行两个方向的弱网引擎。
 pub struct NetworkConditioner {
     state: Mutex<Option<Running>>,
+    lifecycle: Mutex<()>,
     events: Arc<EngineEvents>,
 }
 
 impl NetworkConditioner {
-    pub const DEFAULT_OUTBOUND_FILTER: &'static str = "outbound and (tcp or udp)";
-    pub const DEFAULT_INBOUND_FILTER: &'static str = "inbound and (tcp or udp)";
+    /// WinDivert 把所有回环包都标为 outbound。生产过滤器明确排除回环，
+    /// 避免上行引擎把回环响应当作请求处理；回环验证使用 selftest 的显式过滤器。
+    pub const DEFAULT_OUTBOUND_FILTER: &'static str = "outbound and !loopback and (tcp or udp)";
+    pub const DEFAULT_INBOUND_FILTER: &'static str = "inbound and !loopback and (tcp or udp)";
 
     pub fn new(events: Arc<EngineEvents>) -> Self {
         Self {
             state: Mutex::new(None),
+            lifecycle: Mutex::new(()),
             events,
         }
     }
@@ -77,6 +82,10 @@ impl NetworkConditioner {
         max_queue_delay_ms: i32,
         process_names: &[String],
     ) -> Result<(), String> {
+        let _lifecycle = match self.lifecycle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -117,12 +126,18 @@ impl NetworkConditioner {
 
         if let Err(error) = uplink.start() {
             uplink.stop();
+            if let Some(filter) = process_filter.as_ref() {
+                filter.shutdown();
+            }
             return Err(error);
         }
 
         if let Err(error) = downlink.start() {
             uplink.stop();
             downlink.stop();
+            if let Some(filter) = process_filter.as_ref() {
+                filter.shutdown();
+            }
             return Err(error);
         }
 
@@ -135,6 +150,10 @@ impl NetworkConditioner {
     }
 
     pub fn stop(&self) {
+        let _lifecycle = match self.lifecycle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         let running = match self.state.lock() {
             Ok(mut guard) => guard.take(),
             Err(poisoned) => poisoned.into_inner().take(),
@@ -143,6 +162,9 @@ impl NetworkConditioner {
         if let Some(mut running) = running {
             running.uplink.stop();
             running.downlink.stop();
+            if let Some(filter) = running.process_filter.take() {
+                filter.shutdown();
+            }
         }
     }
 
@@ -176,5 +198,17 @@ fn stats_snapshot(stats: &DirectionStats) -> StatsSnapshot {
         sent: stats.sent(),
         dropped: stats.dropped(),
         queue: stats.queue_count(),
+        failed: stats.failed(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn production_filters_fail_closed_for_loopback() {
+        assert!(NetworkConditioner::DEFAULT_OUTBOUND_FILTER.contains("!loopback"));
+        assert!(NetworkConditioner::DEFAULT_INBOUND_FILTER.contains("!loopback"));
     }
 }

@@ -157,10 +157,11 @@ NetConditioner.exe --self-test
 
 ### 环境要求
 
-- Rust edition 2021。
+- Windows 10 / 11 x64。
+- Rust edition 2021，并安装 `x86_64-pc-windows-msvc` target。
 - Visual Studio 2022 Build Tools，包含“使用 C++ 的桌面开发”。
 - Windows SDK，需要 `rc.exe` 嵌入 manifest 和版本信息。
-- 建议使用 `x86_64-pc-windows-msvc` target。
+- 构建脚本需要 Windows PowerShell 5.1（也兼容 PowerShell 7）；`build.ps1` 使用 UTF-8 BOM 保存中文。
 
 ### 构建
 
@@ -169,9 +170,15 @@ cd NetConditioner
 .\build.ps1
 ```
 
-也可以双击 `build.cmd`。默认执行编译、单元测试，并生成发布产物。
+默认以 Release 配置编译和运行单元测试，然后生成发布产物。脚本固定使用 `cargo build/test --locked --target x86_64-pc-windows-msvc`，并检查 exe 的 PE machine 必须为 x64，避免误打包其他架构或旧目录中的文件。
 
-只编译和测试：
+也可以运行 `build.cmd` 并附加相同参数。它**默认不暂停**，适合自动化；双击使用时请显式加 `-Pause`，以便在窗口关闭前查看结果：
+
+```bat
+build.cmd -Pause
+```
+
+只编译和测试（不生成 `dist` 产物）：
 
 ```powershell
 .\build.ps1 -SkipPackage
@@ -183,37 +190,61 @@ cd NetConditioner
 .\build.ps1 -SkipTests
 ```
 
-手动构建：
+Debug 构建只输出到 `dist\debug\NetConditioner-<版本>-win-x64-debug.exe`，不会生成或更新 `latest.json`，不得作为正式版发布：
 
 ```powershell
-cargo build --release
-cargo test --release
-.\target\release\NetConditioner.exe
+.\build.ps1 -Configuration Debug -SkipTests
+```
+
+手动构建（版本与架构检查由构建脚本负责）：
+
+```powershell
+cargo build --release --locked --target x86_64-pc-windows-msvc
+cargo test --release --locked --target x86_64-pc-windows-msvc
+.\target\x86_64-pc-windows-msvc\release\NetConditioner.exe
 ```
 
 ### 构建参数
 
 | 参数 | 说明 |
 | --- | --- |
-| `-Version <版本>` | 指定产物文件名和 `latest.json` 版本；exe 内嵌版本由 `Cargo.toml` 决定 |
+| `-Version <版本>` | 可选；必须与 `Cargo.toml` 的规范版本完全一致，否则失败。省略时直接读取 `Cargo.toml` |
 | `-UpdateBaseUrl <url>` | 更新包 URL 前缀 |
 | `-PageUrl <url>` | 清单中的发布页面地址 |
 | `-Notes <文本>` | 清单中的更新说明 |
 | `-Clean` | 构建前清理 `target` 和 `dist` |
 | `-SkipTests` | 跳过单元测试 |
 | `-SkipPackage` | 只编译和测试 |
-| `-Configuration Debug` | 使用 Debug 构建，默认 Release |
+| `-Configuration Debug` | 使用 Debug 构建并输出到 `dist\debug\`；默认 Release |
+| `-Pause` | 仅供 `build.cmd` 使用；进程退出后暂停，默认不暂停 |
 
-exe 内嵌版本来自 `Cargo.toml`。发布前应同步修改 Cargo 版本并从当前提交重新构建。
+exe 内嵌版本来自 `Cargo.toml` 的 `[package].version`，格式必须为 2–4 个规范数值段（不允许前导零，每段不超过 Int32）。`app.manifest` 的 `assemblyIdentity.version` 必须同步为四位版本（例如 Cargo `2.1.0` 对应 manifest `2.1.0.0`）；构建脚本会在编译前检查两者，不一致即失败。修改版本时需同时更新这两个文件并提交。
 
-### 发布产物
+### 发布产物与检查
+
+Release 构建生成：
 
 ```text
 dist\NetConditioner-<版本>-win-x64.exe
 dist\latest.json
 ```
 
-将 exe 和 `latest.json` 上传到同一个 Release。
+将同一构建的 exe 和 `latest.json` 上传到同一个 Release；`latest.json` 中的版本、URL、SHA256 和大小必须对应该 exe。Debug 产物不会生成或更新 `latest.json`。
+
+当前发布流程**不对 exe 进行 Authenticode 签名**。未签名程序可能触发 SmartScreen 提示；清单中的 `requireAdministrator` 只用于请求管理员权限，不代表代码签名。如需签名，应在本次构建产生的 exe 上签名后，用签名后的文件重新计算并写入 `latest.json` 的 SHA256 和大小，不要先上传旧清单。
+
+### 从精确提交打标签
+
+1. 确认 `Cargo.toml`、`Cargo.lock`、`app.manifest` 和所有源码改动均已提交，工作区干净。
+2. 从该提交执行 `.\build.ps1`（不要跳过测试），确认 x64 产物、版本和 `latest.json` 一致。
+3. 记录该提交的完整 SHA，并为**这个精确提交**创建版本标签，例如：
+
+   ```powershell
+   git rev-parse HEAD
+   git tag -a v2.1.0 <上述完整提交SHA> -m "NetConditioner v2.1.0"
+   ```
+
+4. 推送提交和标签后，从该标签对应的同一构建产物创建 Release。不要在另一个提交上补建同版本标签；若标签已存在且指向错误，必须先由维护者授权并评估对现有用户更新的影响，不能直接移动。
 
 ## 许可
 

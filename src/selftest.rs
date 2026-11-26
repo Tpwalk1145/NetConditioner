@@ -6,6 +6,7 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket,
 };
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -52,6 +53,10 @@ impl Log {
 }
 
 pub fn run() -> i32 {
+    if let Ok(port) = std::env::var("NC_SELFTEST_LOOPBACK_SERVER") {
+        return port.parse::<u16>().map_or(2, loopback_server_child);
+    }
+
     let log_path = std::env::temp_dir().join("NetConditioner-selftest.log");
     let mut log = Log::default();
     log.write(&format!(
@@ -87,8 +92,10 @@ pub fn run() -> i32 {
             "C:\\Tools\\MyApp.EXE".to_string(),
             "chrome.exe".to_string(),
         ];
-        let mut profile = NetworkProfile::default();
-        profile.name = "process-config-test".to_string();
+        let profile = NetworkProfile {
+            name: "process-config-test".to_string(),
+            ..Default::default()
+        };
         test_config.active_profile_id = Some(profile.id.clone());
         test_config.profiles.push(profile);
 
@@ -148,9 +155,9 @@ pub fn run() -> i32 {
     let parsed_manifest = UpdateService::try_parse_manifest(&valid_manifest);
     let invalid_manifests = [
         format!("{{\"schemaVersion\":2,\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
-        format!("{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"abc\"}}}}"),
+        "{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{\"url\":\"https://example.com/a.exe\",\"sha256\":\"abc\"}}".to_string(),
         format!("{{\"schemaVersion\":2,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"http://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
-        format!("{{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{{\"url\":\"https://example.com/a.exe\",\"sha256\":\"{sample_sha}\"}}}}"),
+            "{\"schemaVersion\":1,\"version\":\"9.9.9\",\"installer\":{\"url\":\"https://example.com/a.exe\",\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}".to_string(),
         "not json".to_string(),
     ];
     let mut invalid_rejected = true;
@@ -317,6 +324,48 @@ pub fn run() -> i32 {
         }
     };
     log.write(&format!("基线 RTT 中位数：{baseline} ms"));
+
+    // 生产过滤器必须对回环 fail closed：客户端与服务器分进程，默认过滤器不应改变 RTT。
+    {
+        let loopback_port = find_free_tcp_port(LOOPBACK);
+        let child = Command::new(std::env::current_exe().unwrap_or_default())
+            .arg("--self-test")
+            .env("NC_SELFTEST_LOOPBACK_SERVER", loopback_port.to_string())
+            .spawn();
+        match child {
+            Ok(mut child) => {
+                thread::sleep(Duration::from_millis(300));
+                let conditioner = make_conditioner();
+                let profile = NetworkProfile {
+                    name: "self-test-production-loopback".to_string(),
+                    uplink: DirectionProfile {
+                        delay_ms: 300,
+                        ..Default::default()
+                    },
+                    protocol: ConditionProtocol::Tcp,
+                    ..Default::default()
+                };
+                if let Err(error) = conditioner.start(&profile, None, None, 2000, &[]) {
+                    log.fail(&format!("生产过滤器回环测试启动失败：{error}"));
+                } else {
+                    thread::sleep(Duration::from_millis(200));
+                    match measure_echo(loopback_port, 3, 3000, LOOPBACK) {
+                        Some(value) if value <= baseline + 150 => log.pass(&format!(
+                            "生产过滤器排除回环：独立客户端/服务器 RTT {value} ms"
+                        )),
+                        Some(value) => {
+                            log.fail(&format!("生产过滤器错误处理了回环响应：RTT {value} ms"))
+                        }
+                        None => log.fail("生产过滤器回环测试连接失败。"),
+                    }
+                    conditioner.stop();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Err(error) => log.skip(&format!("无法启动独立回环服务器进程：{error}")),
+        }
+    }
 
     let out_filter = format!("outbound and tcp and tcp.DstPort == {port}");
     let in_filter = format!("inbound and tcp and tcp.SrcPort == {port}");
@@ -966,6 +1015,15 @@ fn echo_connection(mut stream: TcpStream) {
     }
 }
 
+fn loopback_server_child(port: u16) -> i32 {
+    let Some(server) = EchoServer::start(LOOPBACK, port) else {
+        return 2;
+    };
+    thread::sleep(Duration::from_secs(30));
+    drop(server);
+    0
+}
+
 struct EchoServer {
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
@@ -1023,11 +1081,8 @@ impl UdpEchoServer {
         let handle = thread::spawn(move || {
             let mut buffer = [0u8; 2048];
             while !stop_thread.load(Ordering::Relaxed) {
-                match socket.recv_from(&mut buffer) {
-                    Ok((read, remote)) => {
-                        let _ = socket.send_to(&buffer[..read], remote);
-                    }
-                    Err(_) => {}
+                if let Ok((read, remote)) = socket.recv_from(&mut buffer) {
+                    let _ = socket.send_to(&buffer[..read], remote);
                 }
             }
         });

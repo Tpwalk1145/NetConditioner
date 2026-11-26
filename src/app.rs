@@ -1,5 +1,6 @@
 //! 应用状态与主窗口消息处理。
 
+use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, AtomicPtr, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -16,10 +17,10 @@ use crate::config::{self, AppConfig, NetworkProfile, ProfileStore, MAX_PROCESS_C
 use crate::engine::{EngineEvent, EngineEvents, NetworkConditioner};
 use crate::hotkey;
 use crate::ui::ids;
-use crate::ui::main_window::MainWindow;
-use crate::ui::process_selector::{self, ProcessSelector};
-use crate::ui::profile_editor::{self, EditorOutcome, ProfileEditor};
-use crate::ui::settings::{self, SettingsDialog, SettingsOutcome};
+use crate::ui::main_window::{self, MainWindow};
+use crate::ui::process_selector::ProcessSelector;
+use crate::ui::profile_editor::{EditorOutcome, ProfileEditor};
+use crate::ui::settings::{SettingsDialog, SettingsOutcome};
 use crate::ui::tray::{Tray, TrayCommand};
 use crate::ui::widgets::{self, Fonts, Widget, CARD, GRAY, GREEN, ORANGE, RED, SURFACE, TEXT_DARK};
 use crate::update::coordinator::{
@@ -34,17 +35,52 @@ const TIMER_STARTUP_UPDATE: usize = 2;
 const TIMER_PERIODIC_UPDATE: usize = 3;
 const HOTKEY_ID: i32 = 0x4E43; // 'NC'
 
-static APP_PTR: AtomicPtr<App> = AtomicPtr::new(std::ptr::null_mut());
+static APP_PTR: AtomicPtr<RefCell<App>> = AtomicPtr::new(std::ptr::null_mut());
+thread_local! {
+    static MODAL_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
 
-pub fn app() -> &'static mut App {
-    unsafe { &mut *APP_PTR.load(Ordering::Relaxed) }
+pub fn try_app() -> Option<RefMut<'static, App>> {
+    let pointer = APP_PTR.load(Ordering::Relaxed);
+    if pointer.is_null() {
+        return None;
+    }
+    unsafe { &*pointer }.try_borrow_mut().ok()
+}
+
+struct ModalGuard;
+
+impl ModalGuard {
+    fn new() -> Option<Self> {
+        if MODAL_ACTIVE.with(|active| active.replace(true)) {
+            return None;
+        }
+        Some(Self)
+    }
+}
+
+impl Drop for ModalGuard {
+    fn drop(&mut self) {
+        MODAL_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+#[derive(Clone, Copy)]
+enum MainAction {
+    CreateProfile,
+    EditProfile,
+    SelectProcesses,
+    ChangeSettings,
 }
 
 pub fn run() -> i32 {
-    let mut app = Box::new(App::new());
-    APP_PTR.store(&mut *app as *mut App, Ordering::Relaxed);
-    app.build();
-    app.after_show();
+    let app = Box::new(RefCell::new(App::new()));
+    APP_PTR.store(
+        &*app as *const RefCell<App> as *mut RefCell<App>,
+        Ordering::Relaxed,
+    );
+    app.borrow_mut().build();
+    app.borrow_mut().after_show();
     let code = win::message_loop();
     drop(app);
     code
@@ -88,6 +124,14 @@ impl Dialog {
             Dialog::Selector(selector) => selector.hwnd,
         }
     }
+
+    pub fn fonts(&self) -> &Fonts {
+        match self {
+            Dialog::Editor(editor) => editor.fonts(),
+            Dialog::Settings(settings) => settings.fonts(),
+            Dialog::Selector(selector) => selector.fonts(),
+        }
+    }
 }
 
 pub struct App {
@@ -104,6 +148,7 @@ pub struct App {
     pub fonts: Fonts,
     pub main: Option<MainWindow>,
     pub tray: Option<Tray>,
+    taskbar_created_message: u32,
     pub hotkey_registered: bool,
     pub hotkey_error: String,
     pub is_running: bool,
@@ -116,8 +161,28 @@ pub struct App {
     pub run_started_at: Option<Instant>,
     pub auto_stop_at: Option<Instant>,
     pub dialog: Option<Dialog>,
+    pending_action: Option<MainAction>,
     pub updater: UpdaterState,
+    update_generation: u64,
+    active_update_request: Option<(u64, String)>,
+    pending_update_request: Option<(u64, String)>,
     pub white_brush: HBRUSH,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(hwnd) = self.main_hwnd() {
+            win::unregister_hotkey(hwnd, HOTKEY_ID);
+        }
+        if let Some(mut tray) = self.tray.take() {
+            tray.destroy();
+        }
+        self.fonts.destroy();
+        if !self.white_brush.is_null() {
+            win::delete_object(self.white_brush);
+            self.white_brush = std::ptr::null_mut();
+        }
+    }
 }
 
 impl App {
@@ -152,6 +217,7 @@ impl App {
             fonts,
             main: None,
             tray: None,
+            taskbar_created_message: 0,
             hotkey_registered: false,
             hotkey_error: String::new(),
             is_running: false,
@@ -164,7 +230,11 @@ impl App {
             run_started_at: None,
             auto_stop_at: None,
             dialog: None,
+            pending_action: None,
             updater: UpdaterState::default(),
+            update_generation: 0,
+            active_update_request: None,
+            pending_update_request: None,
             white_brush,
         }
     }
@@ -184,6 +254,8 @@ impl App {
         self.main = Some(main);
 
         self.tray = Some(Tray::new(hwnd));
+        self.taskbar_created_message =
+            unsafe { RegisterWindowMessageW(win::wide("TaskbarCreated").as_ptr()) };
         self.register_hotkey(self.config.hotkey.modifiers, self.config.hotkey.key);
 
         win::set_timer(hwnd, TIMER_STATS, 500);
@@ -224,10 +296,43 @@ impl App {
         win::message_box(owner, text, title, flags)
     }
 
+    pub fn cleanup_dialog_widgets(&mut self, hwnd: HWND) {
+        self.widgets.remove(&(hwnd as isize));
+        for child in win::child_windows(hwnd) {
+            self.widgets.remove(&(child as isize));
+        }
+    }
+
+    pub fn button_colors(&self, hwnd: HWND) -> Option<(u32, u32)> {
+        let widget = self.widgets.get(&(hwnd as isize))?;
+        match &widget.kind {
+            widgets::WidgetKind::Button {
+                bg,
+                fg,
+                disabled_bg,
+                ..
+            } => Some((
+                if win::is_window_enabled(hwnd) {
+                    *bg
+                } else {
+                    *disabled_bg
+                },
+                *fg,
+            )),
+            _ => None,
+        }
+    }
+
     pub fn draw_item(&self, lparam: LPARAM) -> isize {
         if lparam != 0 {
             let dis = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
-            widgets::draw_item(dis, &self.widgets, &self.fonts);
+            let parent = win::parent_hwnd(dis.hwndItem);
+            let fonts = self
+                .dialog
+                .as_ref()
+                .filter(|dialog| dialog.hwnd() == dis.hwndItem || dialog.hwnd() == parent)
+                .map_or(&self.fonts, Dialog::fonts);
+            widgets::draw_item(dis, &self.widgets, fonts);
             1
         } else {
             0
@@ -602,6 +707,20 @@ impl App {
             match self.update_rx.try_recv() {
                 Ok(UpdateEvent::Tick(outcome)) => {
                     self.updater.busy = false;
+                    let request = self.active_update_request.take();
+                    let current = (
+                        self.update_generation,
+                        self.config.settings.update_feed_url.trim().to_string(),
+                    );
+                    let auto_update = self.config.settings.auto_update;
+                    if request.as_ref() != Some(&current) || !auto_update {
+                        UpdateService::log("忽略来自旧更新设置的检查结果。");
+                        self.maybe_tick_update();
+                        continue;
+                    }
+                    if matches!(&outcome, TickOutcome::Ready { .. }) {
+                        self.pending_update_request = request.clone();
+                    }
                     self.apply_update_outcome(outcome);
                 }
                 Err(_) => break,
@@ -632,7 +751,8 @@ impl App {
         }
 
         self.updater.busy = true;
-        let feed_url = settings.update_feed_url.clone();
+        let feed_url = settings.update_feed_url.trim().to_string();
+        self.active_update_request = Some((self.update_generation, feed_url.clone()));
         let snapshot = UpdateSettingsSnapshot {
             last_update_attempt_unix: settings.last_update_attempt_unix,
             last_attempted_version: settings.last_attempted_version.clone(),
@@ -689,6 +809,18 @@ impl App {
         let Some((manifest, installer)) = self.updater.pending.clone() else {
             return;
         };
+        let current = (
+            self.update_generation,
+            self.config.settings.update_feed_url.trim().to_string(),
+        );
+        if !self.config.settings.auto_update
+            || self.config.settings.update_feed_url.trim().is_empty()
+            || self.pending_update_request.as_ref() != Some(&current)
+        {
+            self.updater.pending = None;
+            self.pending_update_request = None;
+            return;
+        }
 
         if !self.is_idle() {
             if !self.updater.deferred_logged {
@@ -738,69 +870,6 @@ impl App {
         }
     }
 
-    fn create_profile(&mut self) {
-        if self.is_running || self.is_busy {
-            return;
-        }
-
-        let Some(outcome) = profile_editor::open(self, None, false) else {
-            self.update_ui();
-            return;
-        };
-        let EditorOutcome::Saved(profile) = outcome else {
-            return;
-        };
-
-        self.config.active_profile_id = Some(profile.id.clone());
-        self.config.profiles.push(profile);
-        self.save_config();
-        self.bind_profiles();
-        self.update_ui();
-    }
-
-    fn edit_profile(&mut self) {
-        if self.is_busy {
-            return;
-        }
-        let Some(current) = self.config.find_active_profile().cloned() else {
-            return;
-        };
-        let was_running = self.is_running;
-        let allow_delete = !was_running;
-
-        let Some(outcome) = profile_editor::open(self, Some(&current), allow_delete) else {
-            self.update_ui();
-            return;
-        };
-
-        match outcome {
-            EditorOutcome::Deleted => {
-                self.delete_profile_by_id(&current.id);
-            }
-            EditorOutcome::Saved(profile) => {
-                let Some(index) = self
-                    .config
-                    .profiles
-                    .iter()
-                    .position(|candidate| candidate.id == current.id)
-                else {
-                    return;
-                };
-                self.config.profiles[index] = profile.clone();
-                self.config.active_profile_id = Some(profile.id.clone());
-                self.save_config();
-                self.bind_profiles();
-                self.update_ui();
-
-                if was_running {
-                    self.stop_engine_sync();
-                    self.update_ui();
-                    self.start_async();
-                }
-            }
-        }
-    }
-
     fn delete_profile(&mut self) {
         if self.is_running || self.is_busy {
             return;
@@ -844,86 +913,6 @@ impl App {
         self.save_config();
         self.bind_profiles();
         self.update_ui();
-    }
-
-    fn select_processes(&mut self) {
-        if self.is_running || self.is_busy {
-            return;
-        }
-
-        let Some(names) = process_selector::open(self) else {
-            self.update_ui();
-            return;
-        };
-
-        if names.len() > MAX_PROCESS_COUNT {
-            self.show_message(
-                &format!("目标进程最多 {MAX_PROCESS_COUNT} 个。"),
-                "目标进程",
-                MB_OK | MB_ICONWARNING,
-            );
-            self.update_ui();
-            return;
-        }
-
-        self.config.settings.process_names = names;
-        self.save_config();
-        self.update_ui();
-    }
-
-    fn change_settings(&mut self) {
-        if self.is_busy {
-            return;
-        }
-
-        let old_hotkey = self.config.hotkey.clone();
-        if let Some(hwnd) = self.main_hwnd() {
-            win::unregister_hotkey(hwnd, HOTKEY_ID);
-        }
-        self.hotkey_registered = false;
-
-        let Some(outcome) = settings::open(self) else {
-            self.register_hotkey(old_hotkey.modifiers, old_hotkey.key);
-            self.update_ui();
-            return;
-        };
-
-        let SettingsOutcome {
-            hotkey: new_hotkey,
-            max_run_minutes,
-            max_queue_delay_ms,
-            auto_update,
-            update_feed_url,
-        } = outcome;
-
-        self.register_hotkey(new_hotkey.modifiers, new_hotkey.key);
-        if !self.hotkey_registered {
-            self.register_hotkey(old_hotkey.modifiers, old_hotkey.key);
-            let message = format!(
-                "新的快捷键无法注册：{}\r\n{}",
-                self.hotkey_error,
-                if self.hotkey_registered {
-                    "已保留原快捷键。"
-                } else {
-                    "原快捷键也无法重新注册，请尽快重新设置。"
-                }
-            );
-            self.show_message(&message, "快捷键", MB_OK | MB_ICONWARNING);
-            self.update_ui();
-            return;
-        }
-
-        self.config.hotkey = new_hotkey;
-        self.config.settings.max_run_minutes = max_run_minutes;
-        self.config.settings.max_queue_delay_ms = max_queue_delay_ms;
-        self.config.settings.auto_update = auto_update;
-        self.config.settings.update_feed_url = update_feed_url;
-        if self.is_running {
-            self.schedule_auto_stop();
-        }
-        self.save_config();
-        self.update_ui();
-        self.maybe_tick_update();
     }
 
     fn hide_to_tray(&mut self) {
@@ -982,7 +971,7 @@ impl App {
         match command {
             TrayCommand::Show => self.show_from_tray(),
             TrayCommand::Toggle => self.toggle(),
-            TrayCommand::Settings => self.change_settings(),
+            TrayCommand::Settings => self.pending_action = Some(MainAction::ChangeSettings),
             TrayCommand::Exit => self.exit_app(),
         }
     }
@@ -1025,17 +1014,28 @@ impl App {
                 win::set_text_color(wparam as HDC, TEXT_DARK);
                 Some(self.white_brush as isize)
             }
+            WM_CTLCOLORBTN => {
+                let hwnd = lparam as HWND;
+                let colors = self.button_colors(hwnd);
+                colors.map(|(background, foreground)| {
+                    win::set_dc_brush_color(wparam as HDC, background);
+                    win::set_text_color(wparam as HDC, foreground);
+                    win::dc_brush() as isize
+                })
+            }
             WM_COMMAND => {
-                let id = (wparam & 0xFFFF) as usize;
+                let id = wparam & 0xFFFF;
                 let code = ((wparam >> 16) & 0xFFFF) as u32;
                 match id {
                     ids::MAIN_PROFILE_COMBO if code == CBN_SELCHANGE => self.on_profile_changed(),
-                    ids::MAIN_NEW => self.create_profile(),
-                    ids::MAIN_EDIT => self.edit_profile(),
+                    ids::MAIN_NEW => self.pending_action = Some(MainAction::CreateProfile),
+                    ids::MAIN_EDIT => self.pending_action = Some(MainAction::EditProfile),
                     ids::MAIN_DELETE => self.delete_profile(),
-                    ids::MAIN_PROCESS_BUTTON => self.select_processes(),
+                    ids::MAIN_PROCESS_BUTTON => {
+                        self.pending_action = Some(MainAction::SelectProcesses)
+                    }
                     ids::MAIN_TOGGLE => self.toggle(),
-                    ids::MAIN_SETTINGS => self.change_settings(),
+                    ids::MAIN_SETTINGS => self.pending_action = Some(MainAction::ChangeSettings),
                     ids::MAIN_MINIMIZE => self.hide_to_tray(),
                     ids::MAIN_EXIT => self.exit_app(),
                     _ => {}
@@ -1074,6 +1074,12 @@ impl App {
                 }
                 Some(0)
             }
+            _ if self.taskbar_created_message != 0 && message == self.taskbar_created_message => {
+                if let Some(tray) = &mut self.tray {
+                    tray.restore();
+                }
+                Some(0)
+            }
             WM_CLOSE => {
                 if self.exit_requested {
                     win::destroy(hwnd);
@@ -1104,6 +1110,11 @@ impl App {
             return;
         };
 
+        if let Some(dialog) = self.dialog.take() {
+            self.cleanup_dialog_widgets(dialog.hwnd());
+            win::destroy(dialog.hwnd());
+        }
+
         // 销毁旧子控件后按新 DPI 重建。
         unsafe {
             let mut child = GetWindow(main.hwnd, GW_CHILD);
@@ -1116,9 +1127,14 @@ impl App {
         self.widgets.clear();
 
         self.fonts.destroy();
-        self.fonts = Fonts::new(new_dpi);
-        main.dpi = new_dpi;
-        main.scale = new_dpi as f64 / 96.0;
+        main.scale = win::fit_dialog_scale(
+            main.hwnd,
+            main_window::CLIENT_WIDTH,
+            main_window::CLIENT_HEIGHT,
+            new_dpi as f64 / 96.0,
+        );
+        main.dpi = (main.scale * 96.0).round() as u32;
+        self.fonts = Fonts::new(main.dpi);
         main.build(&mut self.widgets, &self.fonts);
         main.apply_fonts(&self.fonts);
         widgets::apply_fonts(&self.widgets, &self.fonts);
@@ -1169,9 +1185,11 @@ impl App {
     }
 
     pub fn settings_request_cancel(&mut self) {
-        if let Some(Dialog::Settings(settings)) = &mut self.dialog {
-            settings.cancel();
-        }
+        let Some(Dialog::Settings(mut settings)) = self.dialog.take() else {
+            return;
+        };
+        settings.cancel(self);
+        self.dialog = Some(Dialog::Settings(settings));
     }
 
     pub fn settings_request_confirm(&mut self) {
@@ -1183,6 +1201,254 @@ impl App {
         }
         self.dialog = Some(dialog);
     }
+}
+
+fn execute_main_action(action: MainAction) {
+    match action {
+        MainAction::CreateProfile => execute_create_profile(),
+        MainAction::EditProfile => execute_edit_profile(),
+        MainAction::SelectProcesses => execute_select_processes(),
+        MainAction::ChangeSettings => execute_change_settings(),
+    }
+}
+
+fn run_profile_editor(
+    existing: Option<NetworkProfile>,
+    allow_delete: bool,
+) -> Option<EditorOutcome> {
+    let (hwnd, owner) = {
+        let mut app = try_app()?;
+        if app.dialog.is_some() || app.is_busy || (existing.is_none() && app.is_running) {
+            return None;
+        }
+        let existing_id = existing
+            .as_ref()
+            .map(|profile| profile.id.clone())
+            .unwrap_or_default();
+        let existing_names = app
+            .config
+            .profiles
+            .iter()
+            .filter(|profile| profile.id != existing_id)
+            .map(|profile| profile.name.to_lowercase())
+            .collect();
+        let editor =
+            ProfileEditor::create(&mut app, existing.as_ref(), allow_delete, existing_names);
+        let hwnd = editor.hwnd;
+        let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
+        app.dialog = Some(Dialog::Editor(editor));
+        (hwnd, owner)
+    };
+
+    let _guard = ModalGuard::new()?;
+    win::run_modal(owner, hwnd);
+
+    let mut app = try_app()?;
+    match app.dialog.take() {
+        Some(Dialog::Editor(editor)) => editor.outcome,
+        _ => None,
+    }
+}
+
+fn execute_create_profile() {
+    let Some(EditorOutcome::Saved(profile)) = run_profile_editor(None, false) else {
+        return;
+    };
+    let Some(mut app) = try_app() else {
+        return;
+    };
+    if app.is_running || app.is_busy {
+        return;
+    }
+    app.config.active_profile_id = Some(profile.id.clone());
+    app.config.profiles.push(profile);
+    app.save_config();
+    app.bind_profiles();
+    app.update_ui();
+}
+
+fn execute_edit_profile() {
+    let Some((current, was_running)) = try_app().and_then(|app| {
+        if app.is_busy || app.dialog.is_some() {
+            return None;
+        }
+        app.config
+            .find_active_profile()
+            .cloned()
+            .map(|profile| (profile, app.is_running))
+    }) else {
+        return;
+    };
+
+    let Some(outcome) = run_profile_editor(Some(current.clone()), !was_running) else {
+        if let Some(mut app) = try_app() {
+            app.update_ui();
+        }
+        return;
+    };
+
+    let Some(mut app) = try_app() else {
+        return;
+    };
+    match outcome {
+        EditorOutcome::Deleted => app.delete_profile_by_id(&current.id),
+        EditorOutcome::Saved(profile) => {
+            let Some(index) = app
+                .config
+                .profiles
+                .iter()
+                .position(|candidate| candidate.id == current.id)
+            else {
+                return;
+            };
+            app.config.profiles[index] = profile.clone();
+            app.config.active_profile_id = Some(profile.id.clone());
+            app.save_config();
+            app.bind_profiles();
+            app.update_ui();
+
+            if was_running {
+                app.stop_engine_sync();
+                app.update_ui();
+                app.start_async();
+            }
+        }
+    }
+}
+
+fn run_process_selector() -> Option<Vec<String>> {
+    let (hwnd, owner) = {
+        let mut app = try_app()?;
+        if app.dialog.is_some() || app.is_running || app.is_busy {
+            return None;
+        }
+        let selector = ProcessSelector::create(&mut app);
+        let hwnd = selector.hwnd;
+        let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
+        app.dialog = Some(Dialog::Selector(selector));
+        (hwnd, owner)
+    };
+
+    let _guard = ModalGuard::new()?;
+    win::run_modal(owner, hwnd);
+
+    let mut app = try_app()?;
+    match app.dialog.take() {
+        Some(Dialog::Selector(selector)) => selector.outcome,
+        _ => None,
+    }
+}
+
+fn execute_select_processes() {
+    let Some(names) = run_process_selector() else {
+        return;
+    };
+    let Some(mut app) = try_app() else {
+        return;
+    };
+    if names.len() > MAX_PROCESS_COUNT {
+        app.show_message(
+            &format!("目标进程最多 {MAX_PROCESS_COUNT} 个。"),
+            "目标进程",
+            MB_OK | MB_ICONWARNING,
+        );
+        app.update_ui();
+        return;
+    }
+    app.config.settings.process_names = names;
+    app.save_config();
+    app.update_ui();
+}
+
+fn run_settings_dialog() -> Option<(SettingsOutcome, config::HotkeySettings)> {
+    let (hwnd, owner, old_hotkey) = {
+        let mut app = try_app()?;
+        if app.dialog.is_some() || app.is_busy {
+            return None;
+        }
+        let old_hotkey = app.config.hotkey.clone();
+        if let Some(hwnd) = app.main_hwnd() {
+            win::unregister_hotkey(hwnd, HOTKEY_ID);
+        }
+        app.hotkey_registered = false;
+        let dialog = SettingsDialog::create(&mut app);
+        let hwnd = dialog.hwnd;
+        let owner = app.main_hwnd().unwrap_or(std::ptr::null_mut());
+        app.dialog = Some(Dialog::Settings(dialog));
+        (hwnd, owner, old_hotkey)
+    };
+
+    let _guard = ModalGuard::new()?;
+    win::run_modal(owner, hwnd);
+
+    let mut app = try_app()?;
+    let outcome = match app.dialog.take() {
+        Some(Dialog::Settings(dialog)) => dialog.outcome,
+        _ => None,
+    };
+    outcome.map(|outcome| (outcome, old_hotkey))
+}
+
+fn execute_change_settings() {
+    let Some((outcome, old_hotkey)) = run_settings_dialog() else {
+        if let Some(mut app) = try_app() {
+            if !app.hotkey_registered {
+                let hotkey = app.config.hotkey.clone();
+                app.register_hotkey(hotkey.modifiers, hotkey.key);
+            }
+            app.update_ui();
+        }
+        return;
+    };
+
+    let SettingsOutcome {
+        hotkey: new_hotkey,
+        max_run_minutes,
+        max_queue_delay_ms,
+        auto_update,
+        update_feed_url,
+    } = outcome;
+
+    let Some(mut app) = try_app() else {
+        return;
+    };
+    app.register_hotkey(new_hotkey.modifiers, new_hotkey.key);
+    if !app.hotkey_registered {
+        let new_error = app.hotkey_error.clone();
+        app.register_hotkey(old_hotkey.modifiers, old_hotkey.key);
+        let message = format!(
+            "新的快捷键无法注册：{new_error}\r\n{}",
+            if app.hotkey_registered {
+                "已保留原快捷键。"
+            } else {
+                "原快捷键也无法重新注册，请尽快重新设置。"
+            }
+        );
+        app.show_message(&message, "快捷键", MB_OK | MB_ICONWARNING);
+        app.update_ui();
+        return;
+    }
+
+    let update_settings_changed = auto_update != app.config.settings.auto_update
+        || update_feed_url.trim() != app.config.settings.update_feed_url.trim();
+    if update_settings_changed {
+        app.update_generation = app.update_generation.wrapping_add(1);
+        app.active_update_request = None;
+        app.pending_update_request = None;
+        app.updater.pending = None;
+    }
+
+    app.config.hotkey = new_hotkey;
+    app.config.settings.max_run_minutes = max_run_minutes;
+    app.config.settings.max_queue_delay_ms = max_queue_delay_ms;
+    app.config.settings.auto_update = auto_update;
+    app.config.settings.update_feed_url = update_feed_url;
+    if app.is_running {
+        app.schedule_auto_stop();
+    }
+    app.save_config();
+    app.update_ui();
+    app.maybe_tick_update();
 }
 
 fn format_process_scope(names: &[String]) -> String {
@@ -1213,21 +1479,42 @@ fn register_classes() {
     win::register_class("NCProcessSelector", Some(selector_proc));
 }
 
+unsafe fn defer_main_message(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    match message {
+        win::WM_APP_EVENTS | WM_PAINT | WM_TIMER => {
+            PostMessageW(hwnd, message, wparam, lparam);
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
 unsafe extern "system" fn main_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    let pointer = APP_PTR.load(Ordering::Relaxed);
-    if pointer.is_null() {
-        return DefWindowProcW(hwnd, message, wparam, lparam);
+    if MODAL_ACTIVE.with(|active| active.get()) {
+        return defer_main_message(hwnd, message, wparam, lparam);
     }
-    let app = &mut *pointer;
-    match app.on_main_message(hwnd, message, wparam, lparam) {
+    let Some(mut app) = try_app() else {
+        return defer_main_message(hwnd, message, wparam, lparam);
+    };
+    let result = match app.on_main_message(hwnd, message, wparam, lparam) {
         Some(result) => result,
         None => DefWindowProcW(hwnd, message, wparam, lparam),
+    };
+    let action = app.pending_action.take();
+    drop(app);
+    if let Some(action) = action {
+        execute_main_action(action);
     }
+    result
 }
 
 unsafe extern "system" fn editor_proc(
@@ -1258,13 +1545,32 @@ unsafe extern "system" fn selector_proc(
 }
 
 unsafe fn dispatch_dialog(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    let pointer = APP_PTR.load(Ordering::Relaxed);
-    if pointer.is_null() {
-        return DefWindowProcW(hwnd, message, wparam, lparam);
-    }
-    let app = &mut *pointer;
+    let Some(mut app) = try_app() else {
+        return match message {
+            WM_PAINT => {
+                PostMessageW(hwnd, message, wparam, lparam);
+                0
+            }
+            _ => DefWindowProcW(hwnd, message, wparam, lparam),
+        };
+    };
     match app.on_dialog_message(hwnd, message, wparam, lparam) {
         Some(result) => result,
         None => DefWindowProcW(hwnd, message, wparam, lparam),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ModalGuard, MODAL_ACTIVE};
+
+    #[test]
+    fn modal_guard_rejects_reentry_and_resets_on_drop() {
+        let first = ModalGuard::new().expect("first guard");
+        assert!(MODAL_ACTIVE.with(|active| active.get()));
+        assert!(ModalGuard::new().is_none());
+        drop(first);
+        assert!(!MODAL_ACTIVE.with(|active| active.get()));
+        assert!(ModalGuard::new().is_some());
     }
 }
