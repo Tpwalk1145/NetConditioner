@@ -24,7 +24,7 @@
     .\build.ps1
 
 .EXAMPLE
-    .\build.ps1 -Version 2.1.0 -Clean
+    .\build.ps1 -Version 2.11.0 -Clean
 
 .EXAMPLE
     .\build.ps1 -SkipPackage      # 只编译（并跑测试），不生成 dist 产物

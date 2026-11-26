@@ -218,7 +218,7 @@ cargo test --release --locked --target x86_64-pc-windows-msvc
 | `-Configuration Debug` | 使用 Debug 构建并输出到 `dist\debug\`；默认 Release |
 | `-Pause` | 仅供 `build.cmd` 使用；进程退出后暂停，默认不暂停 |
 
-exe 内嵌版本来自 `Cargo.toml` 的 `[package].version`，格式必须为 2–4 个规范数值段（不允许前导零，每段不超过 Int32）。`app.manifest` 的 `assemblyIdentity.version` 必须同步为四位版本（例如 Cargo `2.1.0` 对应 manifest `2.1.0.0`）；构建脚本会在编译前检查两者，不一致即失败。修改版本时需同时更新这两个文件并提交。
+exe 内嵌版本来自 `Cargo.toml` 的 `[package].version`，格式必须为 2–4 个规范数值段（不允许前导零，每段不超过 Int32）。`app.manifest` 的 `assemblyIdentity.version` 必须同步为四位版本（例如 Cargo `2.11.0` 对应 manifest `2.11.0.0`）；构建脚本会在编译前检查两者，不一致即失败。修改版本时需同时更新这两个文件并提交。
 
 ### 发布产物与检查
 
@@ -241,7 +241,7 @@ dist\latest.json
 
    ```powershell
    git rev-parse HEAD
-   git tag -a v2.1.0 <上述完整提交SHA> -m "NetConditioner v2.1.0"
+   git tag -a v2.11.0 <上述完整提交SHA> -m "NetConditioner v2.11.0"
    ```
 
 4. 推送提交和标签后，从该标签对应的同一构建产物创建 Release。不要在另一个提交上补建同版本标签；若标签已存在且指向错误，必须先由维护者授权并评估对现有用户更新的影响，不能直接移动。

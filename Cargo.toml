@@ -1,6 +1,6 @@
 [package]
 name = "netconditioner"
-version = "2.1.0"
+version = "2.11.0"
 edition = "2021"
 description = "Windows 系统级弱网模拟器（WinDivert + 原生 Win32 界面）"
 publish = false

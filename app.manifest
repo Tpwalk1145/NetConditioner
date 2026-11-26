@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
   <!-- Keep assemblyIdentity.version synchronized with Cargo.toml [package].version (pad to four parts with .0). -->
-  <assemblyIdentity version="2.1.0.0" name="NetConditioner.app" />
+  <assemblyIdentity version="2.11.0.0" name="NetConditioner.app" />
 
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
