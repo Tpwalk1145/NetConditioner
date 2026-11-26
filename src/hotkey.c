@@ -24,8 +24,7 @@ bool nc_hotkey_is_modifier_key(int32_t key) {
     }
 }
 
-bool nc_hotkey_is_valid(uint32_t modifiers, int32_t key) {
-    (void)modifiers;
+bool nc_hotkey_is_valid([[maybe_unused]] uint32_t modifiers, int32_t key) {
     if (key == 0) {
         return false;
     }

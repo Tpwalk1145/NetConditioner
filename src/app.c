@@ -293,11 +293,10 @@ LRESULT nc_app_draw_item(NcApp *app, LPARAM lparam) {
     return 0;
 }
 
-LRESULT nc_app_paint_surface(NcApp *app, HWND hwnd) {
+LRESULT nc_app_paint_surface([[maybe_unused]] NcApp *app, HWND hwnd) {
     PAINTSTRUCT paint;
     HDC hdc;
     RECT rect;
-    (void)app;
     hdc = nc_begin_paint(hwnd, &paint);
     rect = nc_client_rect(hwnd);
     nc_fill_rect(hdc, &rect, NC_COLOR_SURFACE);

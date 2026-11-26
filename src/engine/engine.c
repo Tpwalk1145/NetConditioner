@@ -130,8 +130,9 @@ void nc_conditioner_free(NcNetworkConditioner *conditioner) {
     free(conditioner);
 }
 
-static void abandon_partial(NcNetworkConditioner *conditioner, NcDirectionEngine *uplink,
-                            NcDirectionEngine *downlink, NcProcessFlowFilter *filter) {
+static void abandon_partial([[maybe_unused]] NcNetworkConditioner *conditioner,
+                            NcDirectionEngine *uplink, NcDirectionEngine *downlink,
+                            NcProcessFlowFilter *filter) {
     if (uplink) {
         nc_direction_stop(uplink);
         nc_direction_free(uplink);
@@ -144,7 +145,6 @@ static void abandon_partial(NcNetworkConditioner *conditioner, NcDirectionEngine
         nc_process_filter_shutdown(filter);
         nc_process_filter_free(filter);
     }
-    (void)conditioner;
 }
 
 bool nc_conditioner_start(NcNetworkConditioner *conditioner, const NcProfile *profile,

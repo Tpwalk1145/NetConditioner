@@ -5,7 +5,7 @@
 
 .DESCRIPTION
     默认按顺序执行：
-      1. 用 clang-cl.exe 编译 C17 源码，lld-link.exe 链接，llvm-rc.exe 编译资源；
+      1. 用 clang-cl.exe 编译 C23 源码，lld-link.exe 链接，llvm-rc.exe 编译资源；
          可用 -Toolchain MSVC 切回 cl.exe/link.exe/rc.exe
       2. 运行单元测试（tests 下的控制台测试程序，无需管理员、不联网）
       3. 把 build\NetConditioner.exe 复制为 dist\NetConditioner-<版本>-win-x64.exe，
@@ -482,7 +482,8 @@ $defines = @(
     '/DUNICODE', '/D_UNICODE', '/D_WIN32_WINNT=0x0A00', '/DWIN32_LEAN_AND_MEAN',
     '/D_CRT_SECURE_NO_WARNINGS'
 )
-$commonFlags = @('/nologo', '/c', '/std:c17', '/W4', '/wd5105', '/MT', '/utf-8', '/Zp8') + $defines +
+$stdFlag = if ($Toolchain -eq 'LLVM') { '/clang:-std=c23' } else { '/std:clatest' }
+$commonFlags = @('/nologo', '/c', $stdFlag, '/W4', '/wd5105', '/MT', '/utf-8', '/Zp8') + $defines +
     @('/I', $srcDir, '/I', $genDir)
 if ($Toolchain -eq 'MSVC') {
     $commonFlags += '/MP'

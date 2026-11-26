@@ -2,7 +2,11 @@
 
 #include <stdio.h>
 
+static_assert(__STDC_VERSION__ >= 202311L);
+
 int main(void) {
+    long stdc_version = __STDC_VERSION__;
+    CHECK(stdc_version >= 202311L);
     test_util_run();
     test_json_run();
     test_version_run();

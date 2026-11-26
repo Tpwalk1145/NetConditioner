@@ -26,11 +26,11 @@ void nc_main_window_init(NcMainWindow *window, HWND hwnd) {
     window->dpi = (UINT)(window->scale * 96.0 + 0.5);
 }
 
-void nc_main_window_build(NcMainWindow *window, NcWidgets *widgets, const NcFonts *fonts) {
+void nc_main_window_build(NcMainWindow *window, NcWidgets *widgets,
+                          [[maybe_unused]] const NcFonts *fonts) {
     HWND parent;
     NcMainControls c;
     double scale;
-    (void)fonts;
     if (!window || !widgets) {
         return;
     }

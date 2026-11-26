@@ -9,6 +9,8 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+static_assert(__STDC_VERSION__ >= 202311L, "NetConditioner requires a C23 compiler");
+
 #define NC_ERR_CAP 1024
 
 typedef struct {

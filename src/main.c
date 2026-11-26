@@ -21,24 +21,20 @@ static bool has_flag(int argc, wchar_t **argv, const wchar_t *flag) {
     return false;
 }
 
-static LONG WINAPI crash_filter(EXCEPTION_POINTERS *info) {
+static LONG WINAPI crash_filter([[maybe_unused]] EXCEPTION_POINTERS *info) {
     wchar_t message[512];
-    (void)info;
     swprintf(message, sizeof(message) / sizeof(message[0]),
              L"发生未知错误。\r\n\r\n程序将退出，网络设置会随进程结束恢复。");
     MessageBoxW(NULL, message, L"NetConditioner", MB_OK | MB_ICONERROR);
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR command_line, int show) {
+int WINAPI wWinMain([[maybe_unused]] HINSTANCE instance, [[maybe_unused]] HINSTANCE previous,
+                    [[maybe_unused]] PWSTR command_line, [[maybe_unused]] int show) {
     int argc = 0;
     wchar_t **argv;
     HANDLE mutex;
     int code = 0;
-    (void)instance;
-    (void)previous;
-    (void)command_line;
-    (void)show;
 
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (!argv) {
