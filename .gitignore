@@ -1,5 +1,6 @@
 # 构建输出
-target/
+build/
+dist/
 
 # 编辑器
 .vs/
@@ -8,6 +9,3 @@ target/
 
 # 调试符号
 *.pdb
-
-# 发布产物（单文件 exe 与 latest.json）
-dist/

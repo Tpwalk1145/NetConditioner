@@ -1,5 +1,5 @@
 # Qoder index ignore rules (gitignore-style).
-target/
+build/
 dist/
 
 # Temporary build/test output.
