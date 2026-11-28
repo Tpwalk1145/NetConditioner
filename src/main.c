@@ -4,12 +4,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "app.h"
-#include "licenses.h"
-#include "selftest.h"
+#include "app/app.h"
+#include "app/licenses.h"
+#include "app/selftest.h"
+#include "core/win.h"
 #include "update/checkupdate.h"
 #include "update/selfupdate.h"
-#include "win.h"
 
 static bool has_flag(int argc, wchar_t **argv, const wchar_t *flag) {
     int index;

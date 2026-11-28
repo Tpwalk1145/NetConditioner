@@ -1,16 +1,162 @@
-#include "process_filter.h"
+#include "engine/process_filter.h"
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <winsock2.h>
 #include <ws2ipdef.h>
+#include <windows.h>
 #include <iphlpapi.h>
 #include <tlhelp32.h>
 #include <process.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define NC_FILTER_REFRESH_NS (2ull * 1000000000ull)
+#include "config/config.h"
+#include "core/str.h"
+#include "core/time.h"
+
+#define NC_FILTER_REFRESH_MS 2000u
 #define NC_FILTER_ON_DEMAND_NS (100ull * 1000000ull)
 #define NC_NEGATIVE_CACHE_CAP 8192u
+#define NC_NEGATIVE_TTL_NS (2ull * 1000000000ull)
+#define NC_NEGATIVE_MAX_PROBE 32u
+
+enum {
+    NEG_SLOT_EMPTY = 0,
+    NEG_SLOT_OCCUPIED = 1,
+    NEG_SLOT_TOMBSTONE = 2
+};
+
+typedef struct {
+    uint8_t state;
+    NcNegativeKey key;
+    uint64_t expires_ns;
+} NegativeSlot;
+
+struct NcNegativeCache {
+    NegativeSlot *slots;
+    size_t cap;
+    size_t max_probe;
+};
+
+static uint64_t negative_hash(const NcNegativeKey *key) {
+    return nc_flow_key_hash(key->protocol, &key->local, key->has_remote ? &key->remote : NULL);
+}
+
+static bool negative_key_equal(const NcNegativeKey *a, const NcNegativeKey *b) {
+    return a->protocol == b->protocol && a->has_remote == b->has_remote &&
+           nc_flow_endpoint_equal(&a->local, &b->local) &&
+           (!a->has_remote || nc_flow_endpoint_equal(&a->remote, &b->remote));
+}
+
+NcNegativeCache *nc_negative_cache_new(size_t capacity) {
+    size_t cap = 16;
+    NcNegativeCache *cache;
+    while (cap < capacity && cap < (SIZE_MAX / 2)) {
+        cap *= 2;
+    }
+    cache = (NcNegativeCache *)calloc(1, sizeof(NcNegativeCache));
+    if (!cache) {
+        return NULL;
+    }
+    cache->slots = (NegativeSlot *)calloc(cap, sizeof(NegativeSlot));
+    if (!cache->slots) {
+        free(cache);
+        return NULL;
+    }
+    cache->cap = cap;
+    cache->max_probe = cap < NC_NEGATIVE_MAX_PROBE ? cap : NC_NEGATIVE_MAX_PROBE;
+    return cache;
+}
+
+void nc_negative_cache_free(NcNegativeCache *cache) {
+    if (!cache) {
+        return;
+    }
+    free(cache->slots);
+    free(cache);
+}
+
+bool nc_negative_cache_contains(NcNegativeCache *cache, const NcNegativeKey *key, uint64_t now_ns) {
+    size_t mask;
+    size_t base;
+    size_t step;
+    if (!cache || !cache->slots || !key || cache->cap == 0) {
+        return false;
+    }
+    mask = cache->cap - 1;
+    base = (size_t)(negative_hash(key) & mask);
+    for (step = 0; step < cache->max_probe; step++) {
+        NegativeSlot *slot = &cache->slots[(base + step) & mask];
+        if (slot->state == NEG_SLOT_EMPTY) {
+            return false;
+        }
+        if (slot->state == NEG_SLOT_TOMBSTONE) {
+            continue;
+        }
+        if (negative_key_equal(&slot->key, key)) {
+            if (now_ns < slot->expires_ns) {
+                return true;
+            }
+            slot->state = NEG_SLOT_TOMBSTONE;
+            return false;
+        }
+    }
+    return false;
+}
+
+void nc_negative_cache_insert(NcNegativeCache *cache, const NcNegativeKey *key,
+                              uint64_t now_ns, uint64_t ttl_ns) {
+    size_t mask;
+    size_t base;
+    size_t step;
+    NegativeSlot *reusable = NULL;
+    NegativeSlot *oldest = NULL;
+    if (!cache || !cache->slots || !key || cache->cap == 0) {
+        return;
+    }
+    mask = cache->cap - 1;
+    base = (size_t)(negative_hash(key) & mask);
+    for (step = 0; step < cache->max_probe; step++) {
+        NegativeSlot *slot = &cache->slots[(base + step) & mask];
+        if (slot->state == NEG_SLOT_EMPTY) {
+            NegativeSlot *target = reusable ? reusable : slot;
+            target->state = NEG_SLOT_OCCUPIED;
+            target->key = *key;
+            target->expires_ns = now_ns + ttl_ns;
+            return;
+        }
+        if (slot->state == NEG_SLOT_TOMBSTONE) {
+            if (!reusable) {
+                reusable = slot;
+            }
+            continue;
+        }
+        if (negative_key_equal(&slot->key, key)) {
+            slot->expires_ns = now_ns + ttl_ns;
+            return;
+        }
+        if (now_ns >= slot->expires_ns) {
+            slot->state = NEG_SLOT_TOMBSTONE;
+            if (!reusable) {
+                reusable = slot;
+            }
+            continue;
+        }
+        if (!oldest || slot->expires_ns < oldest->expires_ns) {
+            oldest = slot;
+        }
+    }
+    {
+        NegativeSlot *target = reusable ? reusable : oldest;
+        if (target) {
+            target->state = NEG_SLOT_OCCUPIED;
+            target->key = *key;
+            target->expires_ns = now_ns + ttl_ns;
+        }
+    }
+}
 
 typedef struct {
     DWORD *items;
@@ -57,28 +203,18 @@ typedef enum {
     MATCH_UNKNOWN
 } MatchState;
 
-typedef struct {
-    uint8_t protocol;
-    bool has_remote;
-    NcFlowEndpoint local;
-    NcFlowEndpoint remote;
-} NegativeKey;
-
-typedef struct {
-    bool used;
-    NegativeKey key;
-    uint64_t expires_ns;
-} NegativeSlot;
-
 struct NcProcessFlowFilter {
     NcStringList names;
     SRWLOCK snapshot_lock;
     Snapshot *snapshot;
     volatile LONG stop;
     CRITICAL_SECTION refresh_lock;
-    uint64_t last_refresh_ns;
+    volatile LONG64 last_refresh_done_ns;
+    volatile LONG64 last_refresh_req_ns;
     CRITICAL_SECTION negative_lock;
-    NegativeSlot *negative;
+    NcNegativeCache *negative;
+    HANDLE stop_event;
+    HANDLE refresh_event;
     HANDLE thread;
     DWORD thread_id;
 };
@@ -245,9 +381,7 @@ static bool endpoint_map_insert(EndpointMap *map, const NcFlowEndpoint *key, DWO
     return owners_add(&slot->owners, pid);
 }
 
-static const OwnerList *endpoint_map_lookup(const EndpointMap *map, const NcFlowEndpoint *key);
-
-static const OwnerList *endpoint_map_lookup_impl(const EndpointMap *map, const NcFlowEndpoint *key) {
+static const OwnerList *endpoint_map_lookup(const EndpointMap *map, const NcFlowEndpoint *key) {
     size_t mask;
     size_t index;
     if (!map || map->cap == 0 || !key) {
@@ -265,10 +399,6 @@ static const OwnerList *endpoint_map_lookup_impl(const EndpointMap *map, const N
         }
         index = (index + 1) & mask;
     }
-}
-
-static const OwnerList *endpoint_map_lookup(const EndpointMap *map, const NcFlowEndpoint *key) {
-    return endpoint_map_lookup_impl(map, key);
 }
 
 static FlowSlot *flow_map_find_slot(FlowMap *map, const NcFlowEndpoint *local,
@@ -364,20 +494,7 @@ static const OwnerList *flow_map_lookup(const FlowMap *map, const NcFlowEndpoint
 }
 
 static Snapshot *snapshot_create(void) {
-    Snapshot *snapshot = (Snapshot *)calloc(1, sizeof(Snapshot));
-    if (!snapshot) {
-        return NULL;
-    }
-    snapshot->tcp.slots = NULL;
-    snapshot->tcp.cap = 0;
-    snapshot->tcp.count = 0;
-    snapshot->tcp_flows.slots = NULL;
-    snapshot->tcp_flows.cap = 0;
-    snapshot->tcp_flows.count = 0;
-    snapshot->udp.slots = NULL;
-    snapshot->udp.cap = 0;
-    snapshot->udp.count = 0;
-    return snapshot;
+    return (Snapshot *)calloc(1, sizeof(Snapshot));
 }
 
 static void snapshot_free(Snapshot *snapshot) {
@@ -692,7 +809,7 @@ static bool read_udp_table(Snapshot *snapshot, ULONG family) {
         return false;
     }
     memcpy(&count, buffer, 4);
-    if (family == AF_INET) {
+    if (family == (ULONG)AF_INET) {
         size_t row_size = sizeof(MIB_UDPROW_OWNER_PID);
         size_t index;
         for (index = 0; index < count; index++) {
@@ -770,7 +887,7 @@ static MatchState current_lookup(NcProcessFlowFilter *filter, uint8_t protocol,
     return state;
 }
 
-static bool refresh_now(NcProcessFlowFilter *filter) {
+bool nc_process_filter_refresh_now(NcProcessFlowFilter *filter) {
     Snapshot *snapshot;
     if (!filter || InterlockedCompareExchange(&filter->stop, 0, 0) != 0) {
         return false;
@@ -781,7 +898,7 @@ static bool refresh_now(NcProcessFlowFilter *filter) {
         return false;
     }
     snapshot = snapshot_build(filter);
-    filter->last_refresh_ns = nc_monotonic_ns();
+    InterlockedExchange64(&filter->last_refresh_done_ns, (LONG64)nc_monotonic_ns());
     LeaveCriticalSection(&filter->refresh_lock);
     if (!snapshot) {
         return false;
@@ -790,92 +907,36 @@ static bool refresh_now(NcProcessFlowFilter *filter) {
     return true;
 }
 
-static bool refresh_on_demand(NcProcessFlowFilter *filter) {
-    uint64_t now;
-    if (!TryEnterCriticalSection(&filter->refresh_lock)) {
+/* Non-blocking async refresh trigger for packet hot path. */
+static bool request_async_refresh(NcProcessFlowFilter *filter, uint64_t now) {
+    LONG64 prev = InterlockedCompareExchange64(&filter->last_refresh_req_ns, 0, 0);
+    if (prev > 0 && now >= (uint64_t)prev && (now - (uint64_t)prev) < NC_FILTER_ON_DEMAND_NS) {
         return false;
     }
-    now = nc_monotonic_ns();
-    if (now - filter->last_refresh_ns < NC_FILTER_ON_DEMAND_NS) {
-        LeaveCriticalSection(&filter->refresh_lock);
+    if (InterlockedCompareExchange64(&filter->last_refresh_req_ns, (LONG64)now, prev) != prev) {
         return false;
     }
-    filter->last_refresh_ns = now;
-    LeaveCriticalSection(&filter->refresh_lock);
-    return refresh_now(filter);
-}
-
-static uint64_t negative_hash(const NegativeKey *key) {
-    return nc_flow_key_hash(key->protocol, &key->local, key->has_remote ? &key->remote : NULL);
-}
-
-static bool negative_contains(NcProcessFlowFilter *filter, const NegativeKey *key, uint64_t now) {
-    size_t mask;
-    size_t index;
-    bool found = false;
-    if (!filter->negative) {
-        return false;
+    if (filter->refresh_event) {
+        SetEvent(filter->refresh_event);
     }
-    mask = NC_NEGATIVE_CACHE_CAP - 1;
-    index = (size_t)(negative_hash(key) & mask);
-    EnterCriticalSection(&filter->negative_lock);
-    for (;;) {
-        NegativeSlot *slot = &filter->negative[index];
-        if (!slot->used) {
-            break;
-        }
-        if (slot->key.protocol == key->protocol && slot->key.has_remote == key->has_remote &&
-            nc_flow_endpoint_equal(&slot->key.local, &key->local) &&
-            (!key->has_remote || nc_flow_endpoint_equal(&slot->key.remote, &key->remote))) {
-            if (now < slot->expires_ns) {
-                found = true;
-            } else {
-                slot->used = false;
-            }
-            break;
-        }
-        index = (index + 1) & mask;
-    }
-    LeaveCriticalSection(&filter->negative_lock);
-    return found;
-}
-
-static void negative_insert(NcProcessFlowFilter *filter, const NegativeKey *key, uint64_t now) {
-    size_t mask;
-    size_t index;
-    if (!filter->negative) {
-        return;
-    }
-    mask = NC_NEGATIVE_CACHE_CAP - 1;
-    index = (size_t)(negative_hash(key) & mask);
-    EnterCriticalSection(&filter->negative_lock);
-    for (;;) {
-        NegativeSlot *slot = &filter->negative[index];
-        if (!slot->used || now >= slot->expires_ns) {
-            slot->used = true;
-            slot->key = *key;
-            slot->expires_ns = now + 2000000000ull;
-            break;
-        }
-        index = (index + 1) & mask;
-    }
-    LeaveCriticalSection(&filter->negative_lock);
+    return true;
 }
 
 static unsigned __stdcall filter_thread_main(void *parameter) {
     NcProcessFlowFilter *filter = (NcProcessFlowFilter *)parameter;
-    uint64_t elapsed = 0;
+    HANDLE waits[2];
+    waits[0] = filter->stop_event;
+    waits[1] = filter->refresh_event;
     for (;;) {
-        filter->thread_id = GetCurrentThreadId();
+        DWORD wait;
         if (InterlockedCompareExchange(&filter->stop, 0, 0) != 0) {
             break;
         }
-        Sleep(100);
-        elapsed += 100;
-        if (elapsed >= 2000) {
-            elapsed = 0;
-            refresh_now(filter);
+        wait = WaitForMultipleObjects(2, waits, FALSE, NC_FILTER_REFRESH_MS);
+        if (wait == WAIT_OBJECT_0 || InterlockedCompareExchange(&filter->stop, 0, 0) != 0) {
+            break;
         }
+        nc_process_filter_refresh_now(filter);
     }
     return 0;
 }
@@ -901,18 +962,19 @@ NcProcessFlowFilter *nc_process_filter_new(const char *const *names, size_t coun
     InitializeCriticalSection(&filter->refresh_lock);
     InitializeCriticalSection(&filter->negative_lock);
     filter->snapshot = snapshot_create();
-    filter->last_refresh_ns = nc_monotonic_ns() - NC_FILTER_REFRESH_NS;
-    filter->negative = (NegativeSlot *)calloc(NC_NEGATIVE_CACHE_CAP, sizeof(NegativeSlot));
-    if (filter->names.count == 0 || !filter->snapshot || !filter->negative) {
+    filter->negative = nc_negative_cache_new(NC_NEGATIVE_CACHE_CAP);
+    filter->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    filter->refresh_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (filter->names.count == 0 || !filter->snapshot || !filter->negative ||
+        !filter->stop_event || !filter->refresh_event) {
         return filter;
     }
-    refresh_now(filter);
+    nc_process_filter_refresh_now(filter);
     {
-        uintptr_t thread = _beginthreadex(NULL, 0, filter_thread_main, filter, 0, NULL);
+        unsigned tid = 0;
+        uintptr_t thread = _beginthreadex(NULL, 0, filter_thread_main, filter, 0, &tid);
         filter->thread = (HANDLE)thread;
-    }
-    if (filter->thread) {
-        filter->thread_id = GetThreadId(filter->thread);
+        filter->thread_id = (DWORD)tid;
     }
     return filter;
 }
@@ -923,6 +985,9 @@ void nc_process_filter_shutdown(NcProcessFlowFilter *filter) {
         return;
     }
     InterlockedExchange(&filter->stop, 1);
+    if (filter->stop_event) {
+        SetEvent(filter->stop_event);
+    }
     thread = filter->thread;
     filter->thread = NULL;
     if (thread) {
@@ -938,24 +1003,27 @@ void nc_process_filter_free(NcProcessFlowFilter *filter) {
         return;
     }
     nc_process_filter_shutdown(filter);
+    if (filter->stop_event) {
+        CloseHandle(filter->stop_event);
+    }
+    if (filter->refresh_event) {
+        CloseHandle(filter->refresh_event);
+    }
     nc_string_list_free(&filter->names);
     snapshot_free(filter->snapshot);
     DeleteCriticalSection(&filter->refresh_lock);
     DeleteCriticalSection(&filter->negative_lock);
-    free(filter->negative);
+    nc_negative_cache_free(filter->negative);
     free(filter);
 }
 
 bool nc_process_filter_match(NcProcessFlowFilter *filter, uint8_t protocol,
                              const NcFlowEndpoint *local, const NcFlowEndpoint *remote) {
     MatchState state;
-    NegativeKey key;
+    NcNegativeKey key;
     uint64_t now;
-    bool refreshed;
-    if (!filter) {
-        return true;
-    }
-    if (filter->names.count == 0) {
+    bool cached;
+    if (!filter || filter->names.count == 0) {
         return true;
     }
     state = current_lookup(filter, protocol, local, remote);
@@ -973,19 +1041,19 @@ bool nc_process_filter_match(NcProcessFlowFilter *filter, uint8_t protocol,
         key.remote = *remote;
     }
     now = nc_monotonic_ns();
-    if (negative_contains(filter, &key, now)) {
+    EnterCriticalSection(&filter->negative_lock);
+    cached = nc_negative_cache_contains(filter->negative, &key, now);
+    LeaveCriticalSection(&filter->negative_lock);
+    if (cached) {
         return false;
     }
-    refreshed = refresh_on_demand(filter);
-    state = current_lookup(filter, protocol, local, remote);
-    if (state == MATCH_TARGET) {
-        return true;
-    }
-    if (state == MATCH_NON_TARGET) {
-        return false;
-    }
-    if (refreshed) {
-        negative_insert(filter, &key, nc_monotonic_ns());
+    if (!request_async_refresh(filter, now)) {
+        LONG64 done = InterlockedCompareExchange64(&filter->last_refresh_done_ns, 0, 0);
+        if (done > 0 && now >= (uint64_t)done && (now - (uint64_t)done) < NC_FILTER_ON_DEMAND_NS) {
+            EnterCriticalSection(&filter->negative_lock);
+            nc_negative_cache_insert(filter->negative, &key, now, NC_NEGATIVE_TTL_NS);
+            LeaveCriticalSection(&filter->negative_lock);
+        }
     }
     return false;
 }

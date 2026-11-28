@@ -1,9 +1,11 @@
-#include "windivert.h"
+#include "engine/windivert.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "core/fs.h"
+#include "core/str.h"
 #include "nc_version.h"
 
 typedef INT_PTR(WINAPI *WinDivertOpenFn)(const char *, int, INT16, UINT64);
@@ -34,119 +36,94 @@ const char *nc_windivert_payload_version(void) {
     return NC_WINDIVERT_VERSION;
 }
 
-static bool delete_tree(const wchar_t *path) {
-    wchar_t pattern[32768];
-    WIN32_FIND_DATAW data;
-    HANDLE find;
-    bool ok = true;
-    if (!nc_path_join(pattern, sizeof(pattern) / sizeof(pattern[0]), path, L"*")) {
-        return false;
-    }
-    find = FindFirstFileW(pattern, &data);
-    if (find == INVALID_HANDLE_VALUE) {
-        return RemoveDirectoryW(path) != 0;
-    }
-    do {
-        wchar_t child[32768];
-        if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
-            continue;
-        }
-        if (!nc_path_join(child, sizeof(child) / sizeof(child[0]), path, data.cFileName)) {
-            ok = false;
-            continue;
-        }
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!delete_tree(child)) {
-                ok = false;
-            }
-        } else if (!DeleteFileW(child)) {
-            ok = false;
-        }
-    } while (FindNextFileW(find, &data));
-    FindClose(find);
-    if (!RemoveDirectoryW(path)) {
-        ok = false;
-    }
-    return ok;
-}
-
 static void cleanup_old_versions(const wchar_t *dll_path) {
-    wchar_t current_dir[32768];
-    wchar_t root[32768];
-    wchar_t pattern[32768];
+    WStr current_dir;
+    WStr root;
+    WStr pattern;
+    WStr child;
     WIN32_FIND_DATAW data;
     HANDLE find;
-    current_dir[0] = 0;
-    root[0] = 0;
-    if (!nc_path_parent(dll_path, current_dir, sizeof(current_dir) / sizeof(current_dir[0]))) {
-        return;
+    wstr_init(&current_dir);
+    wstr_init(&root);
+    wstr_init(&pattern);
+    wstr_init(&child);
+    if (!nc_path_parent_w(dll_path, &current_dir) ||
+        !nc_path_parent_w(wstr_cstr(&current_dir), &root) ||
+        !nc_path_join_w(&pattern, wstr_cstr(&root), L"*")) {
+        goto done;
     }
-    if (!nc_path_parent(current_dir, root, sizeof(root) / sizeof(root[0]))) {
-        return;
-    }
-    if (!nc_path_join(pattern, sizeof(pattern) / sizeof(pattern[0]), root, L"*")) {
-        return;
-    }
-    find = FindFirstFileW(pattern, &data);
+    find = FindFirstFileW(wstr_cstr(&pattern), &data);
     if (find == INVALID_HANDLE_VALUE) {
-        return;
+        goto done;
     }
     do {
-        wchar_t child[32768];
         if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
             continue;
         }
         if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
             continue;
         }
-        if (!nc_path_join(child, sizeof(child) / sizeof(child[0]), root, data.cFileName)) {
+        if (!nc_path_join_w(&child, wstr_cstr(&root), data.cFileName)) {
             continue;
         }
-        if (_wcsicmp(child, current_dir) == 0) {
+        if (_wcsicmp(wstr_cstr(&child), wstr_cstr(&current_dir)) == 0) {
             continue;
         }
-        delete_tree(child);
+        nc_delete_tree(wstr_cstr(&child));
     } while (FindNextFileW(find, &data));
     FindClose(find);
+done:
+    wstr_free(&child);
+    wstr_free(&pattern);
+    wstr_free(&root);
+    wstr_free(&current_dir);
 }
 
 static bool write_resource_if_needed(const wchar_t *directory, const wchar_t *name,
                                      const void *bytes, size_t size, NcErr *err) {
-    wchar_t path[32768];
+    WStr path;
+    WStr temp;
     void *existing = NULL;
     size_t existing_size = 0;
     bool equals = false;
     NcErr read_error;
-    if (!nc_path_join(path, sizeof(path) / sizeof(path[0]), directory, name)) {
-        return nc_fail(err, "运行时文件路径过长。");
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    NcErr write_error;
+    bool ok = false;
+    wstr_init(&path);
+    wstr_init(&temp);
+    if (!nc_path_join_w(&path, directory, name)) {
+        nc_err_set(err, "运行时文件路径过长。");
+        goto done;
     }
-    if (nc_read_file(path, size, &existing, &existing_size, &read_error)) {
+    if (nc_read_file(wstr_cstr(&path), size, &existing, &existing_size, &read_error)) {
         if (existing_size == size && (size == 0 || memcmp(existing, bytes, size) == 0)) {
             equals = true;
         }
     }
     free(existing);
     if (equals) {
-        return true;
+        ok = true;
+        goto done;
     }
-    {
-        wchar_t temp[32768];
-        HANDLE handle = INVALID_HANDLE_VALUE;
-        NcErr write_error;
-        if (!nc_create_temp_file(directory, L"WindDivert", bytes, size, temp,
-                                 sizeof(temp) / sizeof(temp[0]), &handle, &write_error)) {
-            return nc_fail(err, "写入 %ls 失败：%s", path, write_error.msg);
-        }
-        CloseHandle(handle);
-        if (!nc_replace_file(temp, path, &write_error)) {
-            nc_remove_file(temp);
-            return nc_fail(err, "替换 %ls 失败：%s", path, write_error.msg);
-        }
+    if (!nc_create_temp_file_w(directory, L"WinDivert", bytes, size, &temp, &handle, &write_error)) {
+        nc_err_set(err, "写入 %ls 失败：%s", wstr_cstr(&path), write_error.msg);
+        goto done;
     }
-    return true;
+    CloseHandle(handle);
+    if (!nc_replace_file(wstr_cstr(&temp), wstr_cstr(&path), &write_error)) {
+        nc_remove_file(wstr_cstr(&temp));
+        nc_err_set(err, "替换 %ls 失败：%s", wstr_cstr(&path), write_error.msg);
+        goto done;
+    }
+    ok = true;
+done:
+    wstr_free(&temp);
+    wstr_free(&path);
+    return ok;
 }
 
-static bool ensure_payload_dir(const wchar_t *directory, wchar_t *dll_path, size_t cap, NcErr *err) {
+static bool ensure_payload_dir(const wchar_t *directory, WStr *dll_path, NcErr *err) {
     HRSRC dll_resource;
     HRSRC sys_resource;
     HGLOBAL dll_data;
@@ -179,56 +156,68 @@ static bool ensure_payload_dir(const wchar_t *directory, wchar_t *dll_path, size
     if (!write_resource_if_needed(directory, L"WinDivert64.sys", sys_bytes, sys_size, err)) {
         return false;
     }
-    if (!nc_path_join(dll_path, cap, directory, L"WinDivert.dll")) {
+    if (!nc_path_join_w(dll_path, directory, L"WinDivert.dll")) {
         return nc_fail(err, "运行时文件路径过长。");
     }
     return true;
 }
 
-static bool resolve_dll_path(wchar_t *out, size_t cap, NcErr *err) {
+static bool resolve_dll_path(WStr *out, NcErr *err) {
     static const wchar_t *variables[] = {L"ProgramFiles", L"ProgramData", L"LOCALAPPDATA"};
-    wchar_t runtime_root[32768];
-    wchar_t directory[32768];
-    wchar_t candidate[32768];
+    WStr base;
+    WStr runtime_root;
+    WStr directory;
+    WStr candidate;
     size_t index;
     NcErr last_error;
+    bool ok = false;
+    wstr_init(&base);
+    wstr_init(&runtime_root);
+    wstr_init(&directory);
+    wstr_init(&candidate);
     nc_err_set(&last_error, "没有可用的运行时目录。");
     for (index = 0; index < sizeof(variables) / sizeof(variables[0]); index++) {
-        wchar_t base[32768];
-        if (!nc_env_absolute_dir(variables[index], base, sizeof(base) / sizeof(base[0]))) {
+        if (!nc_env_absolute_dir_w(variables[index], &base)) {
             continue;
         }
-        if (!nc_path_join(runtime_root, sizeof(runtime_root) / sizeof(runtime_root[0]), base,
-                          L"NetConditioner")) {
+        if (!nc_path_join_w(&runtime_root, wstr_cstr(&base), L"NetConditioner") ||
+            !nc_path_join_w(&directory, wstr_cstr(&runtime_root), L"runtime") ||
+            !nc_path_join_w(&candidate, wstr_cstr(&directory), NC_WINDIVERT_VERSION_WSTR)) {
             continue;
         }
-        if (!nc_path_join(directory, sizeof(directory) / sizeof(directory[0]), runtime_root,
-                          L"runtime")) {
-            continue;
-        }
-        if (!nc_path_join(candidate, sizeof(candidate) / sizeof(candidate[0]), directory,
-                          NC_WINDIVERT_VERSION_WSTR)) {
-            continue;
-        }
-        if (ensure_payload_dir(candidate, out, cap, &last_error)) {
-            cleanup_old_versions(out);
-            return true;
+        if (ensure_payload_dir(wstr_cstr(&candidate), out, &last_error)) {
+            cleanup_old_versions(wstr_cstr(out));
+            ok = true;
+            break;
         }
     }
-    return nc_fail(err, "无法准备 WinDivert 运行时：%s", last_error.msg);
+    wstr_free(&candidate);
+    wstr_free(&directory);
+    wstr_free(&runtime_root);
+    wstr_free(&base);
+    if (!ok) {
+        return nc_fail(err, "无法准备 WinDivert 运行时：%s", last_error.msg);
+    }
+    return true;
 }
 
 static bool load_api(WinDivertApi *api, NcErr *err) {
-    wchar_t dll_path[32768];
+    WStr dll_path;
     HMODULE module;
-    if (!resolve_dll_path(dll_path, sizeof(dll_path) / sizeof(dll_path[0]), err)) {
+    wstr_init(&dll_path);
+    if (!resolve_dll_path(&dll_path, err)) {
+        wstr_free(&dll_path);
         return false;
     }
-    module = LoadLibraryExW(dll_path, NULL, 0x00000008); /* LOAD_WITH_ALTERED_SEARCH_PATH */
+    module = LoadLibraryExW(wstr_cstr(&dll_path), NULL, 0x00000008); /* LOAD_WITH_ALTERED_SEARCH_PATH */
     if (!module) {
-        return nc_fail(err, "无法加载 WinDivert.dll（%ls）：Win32 错误 %lu", dll_path,
-                       (unsigned long)GetLastError());
+        DWORD code = GetLastError();
+        nc_err_set(err, "无法加载 WinDivert.dll（%ls）：Win32 错误 %lu", wstr_cstr(&dll_path),
+                   (unsigned long)code);
+        wstr_free(&dll_path);
+        return false;
     }
+    wstr_free(&dll_path);
     memset(api, 0, sizeof(*api));
     api->open = (WinDivertOpenFn)GetProcAddress(module, "WinDivertOpen");
     api->recv = (WinDivertRecvFn)GetProcAddress(module, "WinDivertRecv");

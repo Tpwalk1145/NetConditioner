@@ -3,9 +3,10 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "config.h"
-#include "update.h"
-#include "version.h"
+#include "config/config.h"
+#include "core/str.h"
+#include "core/version.h"
+#include "update/update.h"
 
 typedef struct {
     int64_t last_update_attempt_unix;
@@ -23,7 +24,7 @@ typedef struct {
     NcTickKind kind;
     char *error;
     NcUpdateManifest manifest;
-    wchar_t installer[32768];
+    WStr installer;
     int64_t now;
 } NcTickOutcome;
 

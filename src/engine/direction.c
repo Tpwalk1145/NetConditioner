@@ -1,40 +1,27 @@
-#include "direction.h"
+#include "engine/direction.h"
 
 #include <process.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "windivert.h"
+#include "core/str.h"
+#include "core/time.h"
+#include "engine/windivert.h"
 
-#define NC_MAX_QUEUE_PACKETS 4096u
-#define NC_MAX_QUEUE_BYTES (8u * 1024u * 1024u)
-#define NC_POOL_LIMIT 1024u
 #define NC_ERROR_NO_DATA 232
 #define NC_WAIT_SLICE_MS 100u
 
-typedef struct QueuedItem {
-    unsigned char *data;
-    size_t cap;
-    size_t length;
-    unsigned char address[NC_WINDIVERT_ADDRESS_SIZE];
-    uint64_t due_ns;
-    uint64_t expires_ns;
-    uint64_t sequence;
-} QueuedItem;
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 typedef struct {
-    QueuedItem **items;
-    size_t len;
-    size_t cap;
-    size_t bytes;
-} PacketQueue;
-
-typedef struct {
-    QueuedItem **items;
-    size_t len;
-    size_t cap;
-} PacketPool;
+    volatile LONG64 sent;
+    volatile LONG64 dropped;
+    volatile LONG queue;
+    volatile LONG failed;
+} DirectionStats;
 
 struct NcDirectionEngine {
     char display[32];
@@ -44,15 +31,16 @@ struct NcDirectionEngine {
     NcConditionProtocol protocol;
     NcProcessFlowFilter *process_filter;
     NcEngineEvents *events;
-    NcDirectionStats stats;
+    DirectionStats stats;
     uint64_t max_queue_ns;
     bool needs_queue;
     volatile LONG64 windivert_handle;
     CRITICAL_SECTION queue_lock;
-    CONDITION_VARIABLE queue_cv;
-    PacketQueue queue;
+    NcPacketQueue queue;
     CRITICAL_SECTION pool_lock;
-    PacketPool pool;
+    NcPacketPool pool;
+    HANDLE stop_event;
+    HANDLE wake_event;
     volatile LONG stop;
     volatile LONG receiver_done;
     volatile LONG fault_reported;
@@ -63,120 +51,23 @@ struct NcDirectionEngine {
     uint64_t base_ns;
 };
 
-static uint64_t sat_add(uint64_t value, uint64_t delta) {
-    return value > UINT64_MAX - delta ? UINT64_MAX : value + delta;
-}
-
-void nc_burst_loss_init(NcBurstLossState *state, int32_t allow_ms, int32_t drop_ms, uint64_t now_ns) {
-    if (!state) {
-        return;
-    }
-    state->allow_ns = allow_ms > 0 ? (uint64_t)allow_ms * 1000000ull : 0;
-    state->drop_ns = drop_ms > 0 ? (uint64_t)drop_ms * 1000000ull : 0;
-    state->phase_start_ns = now_ns;
-}
-
-bool nc_burst_loss_should_drop(const NcBurstLossState *state, uint64_t now_ns) {
-    uint64_t cycle;
-    uint64_t elapsed;
-    if (!state) {
-        return false;
-    }
-    if (state->allow_ns == 0 && state->drop_ns == 0) {
-        return false;
-    }
-    if (state->allow_ns == 0) {
-        return true;
-    }
-    if (state->drop_ns == 0) {
-        return false;
-    }
-    cycle = sat_add(state->allow_ns, state->drop_ns);
-    elapsed = now_ns > state->phase_start_ns ? now_ns - state->phase_start_ns : 0;
-    return (elapsed % cycle) >= state->allow_ns;
-}
-
-uint64_t nc_packet_service_ns(size_t length, uint64_t bandwidth_kbps) {
-    uint64_t service;
-    if (bandwidth_kbps == 0 || length == 0) {
-        return 0;
-    }
-    service = ((uint64_t)length * 8ull * 1000000000ull) / (bandwidth_kbps * 1000ull);
-    return service == 0 ? 1 : service;
-}
-
-void nc_bandwidth_scheduler_init(NcBandwidthScheduler *scheduler) {
-    if (scheduler) {
-        scheduler->next_send_ns = 0;
-    }
-}
-
-bool nc_bandwidth_scheduler_plan(const NcBandwidthScheduler *scheduler, uint64_t now_ns,
-                                 uint64_t intended_delay_ns, size_t length,
-                                 uint64_t bandwidth_kbps, uint64_t max_queue_ns,
-                                 NcSendPlan *out) {
-    uint64_t intended_due_ns;
-    uint64_t packet_ns;
-    uint64_t start_ns;
-    uint64_t due_ns;
-    uint64_t extra_ns;
-    uint64_t expires_ns;
-    if (!scheduler || !out) {
-        return false;
-    }
-    intended_due_ns = sat_add(now_ns, intended_delay_ns);
-    packet_ns = nc_packet_service_ns(length, bandwidth_kbps);
-    start_ns = intended_due_ns > scheduler->next_send_ns ? intended_due_ns : scheduler->next_send_ns;
-    due_ns = sat_add(start_ns, packet_ns);
-    extra_ns = due_ns - intended_due_ns;
-    if (max_queue_ns > 0 && extra_ns > max_queue_ns) {
-        return false;
-    }
-    expires_ns = max_queue_ns > 0 ? sat_add(intended_due_ns, max_queue_ns) : 0;
-    out->due_ns = due_ns;
-    out->next_send_ns = due_ns;
-    out->expires_ns = expires_ns;
-    return true;
-}
-
-void nc_bandwidth_scheduler_commit(NcBandwidthScheduler *scheduler, const NcSendPlan *plan) {
-    if (!scheduler || !plan) {
-        return;
-    }
-    if (plan->next_send_ns > scheduler->next_send_ns) {
-        scheduler->next_send_ns = plan->next_send_ns;
-    }
-}
-
-uint64_t nc_paced_send_time(uint64_t due_ns, bool has_last, uint64_t last_send_end_ns,
-                            uint64_t now_ns) {
-    uint64_t send_at = due_ns;
-    if (has_last && last_send_end_ns > send_at) {
-        send_at = last_send_end_ns;
-    }
-    if (send_at < now_ns) {
-        send_at = now_ns;
-    }
-    return send_at;
-}
-
-static bool stats_failed(const NcDirectionStats *stats) {
+static bool stats_failed(const DirectionStats *stats) {
     return InterlockedCompareExchange((volatile LONG *)&stats->failed, 0, 0) != 0;
 }
 
-static void stats_add_sent(NcDirectionStats *stats) {
+static void stats_add_sent(DirectionStats *stats) {
     InterlockedIncrement64(&stats->sent);
 }
 
-static void stats_add_dropped(NcDirectionStats *stats) {
+static void stats_add_dropped(DirectionStats *stats) {
     InterlockedIncrement64(&stats->dropped);
 }
 
-static bool stats_mark_failed(NcDirectionStats *stats) {
+static bool stats_mark_failed(DirectionStats *stats) {
     return InterlockedExchange((volatile LONG *)&stats->failed, 1) == 0;
 }
 
-static void stats_set_queue(NcDirectionStats *stats, size_t count) {
+static void stats_set_queue(DirectionStats *stats, size_t count) {
     InterlockedExchange((volatile LONG *)&stats->queue, (LONG)count);
 }
 
@@ -201,79 +92,9 @@ void nc_direction_reset_stats(NcDirectionEngine *engine) {
     InterlockedExchange(&engine->stats.queue, 0);
 }
 
-static bool item_before(const QueuedItem *left, const QueuedItem *right) {
-    if (left->due_ns != right->due_ns) {
-        return left->due_ns < right->due_ns;
-    }
-    return left->sequence < right->sequence;
-}
-
-static bool queue_push(PacketQueue *queue, QueuedItem *item) {
-    size_t index;
-    if (queue->len == queue->cap) {
-        size_t cap = queue->cap ? queue->cap * 2 : 64;
-        QueuedItem **items = (QueuedItem **)realloc(queue->items, cap * sizeof(QueuedItem *));
-        if (!items) {
-            return false;
-        }
-        queue->items = items;
-        queue->cap = cap;
-    }
-    index = queue->len++;
-    queue->items[index] = item;
-    while (index > 0) {
-        size_t parent = (index - 1) / 2;
-        if (!item_before(queue->items[index], queue->items[parent])) {
-            break;
-        }
-        {
-            QueuedItem *temp = queue->items[parent];
-            queue->items[parent] = queue->items[index];
-            queue->items[index] = temp;
-        }
-        index = parent;
-    }
-    return true;
-}
-
-static QueuedItem *queue_peek(const PacketQueue *queue) {
-    return queue->len > 0 ? queue->items[0] : NULL;
-}
-
-static void queue_sift_down(PacketQueue *queue, size_t index) {
-    for (;;) {
-        size_t left = index * 2 + 1;
-        size_t right = left + 1;
-        size_t smallest = index;
-        QueuedItem *temp;
-        if (left < queue->len && item_before(queue->items[left], queue->items[smallest])) {
-            smallest = left;
-        }
-        if (right < queue->len && item_before(queue->items[right], queue->items[smallest])) {
-            smallest = right;
-        }
-        if (smallest == index) {
-            break;
-        }
-        temp = queue->items[index];
-        queue->items[index] = queue->items[smallest];
-        queue->items[smallest] = temp;
-        index = smallest;
-    }
-}
-
-static QueuedItem *queue_pop(PacketQueue *queue) {
-    QueuedItem *top;
-    if (queue->len == 0) {
-        return NULL;
-    }
-    top = queue->items[0];
-    queue->len--;
-    if (queue->len > 0) {
-        queue->items[0] = queue->items[queue->len];
-        queue_sift_down(queue, 0);
-    }
-    return top;
+static uint64_t engine_now_ns(const NcDirectionEngine *engine) {
+    uint64_t raw = nc_monotonic_ns();
+    return raw >= engine->base_ns ? raw - engine->base_ns : 0;
 }
 
 static INT_PTR current_handle(const NcDirectionEngine *engine) {
@@ -294,6 +115,12 @@ static void report_fault(NcDirectionEngine *engine, const char *message) {
 static void reporter_fail(NcDirectionEngine *engine, const char *message) {
     if (stats_mark_failed(&engine->stats)) {
         report_fault(engine, message);
+    }
+    if (engine->stop_event) {
+        SetEvent(engine->stop_event);
+    }
+    if (engine->wake_event) {
+        SetEvent(engine->wake_event);
     }
     nc_windivert_shutdown(current_handle(engine), NC_WINDIVERT_SHUTDOWN_RECV);
 }
@@ -326,82 +153,36 @@ static bool protocol_matches(NcConditionProtocol protocol, uint8_t value) {
     }
 }
 
-static QueuedItem *rent_item(NcDirectionEngine *engine) {
-    QueuedItem *item = NULL;
+static NcQueuedPacket *rent_packet(NcDirectionEngine *engine) {
+    NcQueuedPacket *item;
     EnterCriticalSection(&engine->pool_lock);
-    if (engine->pool.len > 0) {
-        item = engine->pool.items[--engine->pool.len];
-    }
+    item = nc_packet_pool_rent(&engine->pool);
     LeaveCriticalSection(&engine->pool_lock);
-    if (!item) {
-        item = (QueuedItem *)calloc(1, sizeof(QueuedItem));
-    }
-    if (item) {
-        item->length = 0;
-        item->due_ns = 0;
-        item->expires_ns = 0;
-        item->sequence = 0;
-    }
     return item;
 }
 
-static bool item_reserve(QueuedItem *item, size_t length) {
-    if (item->cap >= length) {
-        return true;
-    }
-    {
-        unsigned char *data = (unsigned char *)realloc(item->data, length);
-        if (!data) {
-            return false;
-        }
-        item->data = data;
-        item->cap = length;
-    }
-    return true;
-}
-
-static void return_item(NcDirectionEngine *engine, QueuedItem *item) {
+static void return_packet(NcDirectionEngine *engine, NcQueuedPacket *item) {
     if (!item) {
         return;
     }
-    item->length = 0;
-    item->due_ns = 0;
-    item->expires_ns = 0;
-    item->sequence = 0;
     EnterCriticalSection(&engine->pool_lock);
-    if (engine->pool.len < NC_POOL_LIMIT) {
-        if (engine->pool.len == engine->pool.cap) {
-            size_t cap = engine->pool.cap ? engine->pool.cap * 2 : 64;
-            QueuedItem **items = (QueuedItem **)realloc(engine->pool.items, cap * sizeof(QueuedItem *));
-            if (items) {
-                engine->pool.items = items;
-                engine->pool.cap = cap;
-            }
-        }
-        if (engine->pool.len < engine->pool.cap) {
-            engine->pool.items[engine->pool.len++] = item;
-            item = NULL;
-        }
-    }
+    nc_packet_pool_return(&engine->pool, item);
     LeaveCriticalSection(&engine->pool_lock);
-    if (item) {
-        free(item->data);
-        free(item);
-    }
 }
 
 static bool enqueue_packet(NcDirectionEngine *engine, const void *packet, size_t length,
                            const void *address, uint64_t due_ns, uint64_t expires_ns,
                            uint64_t sequence) {
-    QueuedItem *item = rent_item(engine);
+    NcQueuedPacket *item = rent_packet(engine);
     uint64_t old_head_due = 0;
     bool had_head = false;
     bool inserted = false;
+    bool should_wake = false;
     if (!item) {
         return false;
     }
-    if (!item_reserve(item, length)) {
-        return_item(engine, item);
+    if (!nc_packet_reserve(item, length)) {
+        return_packet(engine, item);
         return false;
     }
     memcpy(item->data, packet, length);
@@ -413,64 +194,107 @@ static bool enqueue_packet(NcDirectionEngine *engine, const void *packet, size_t
     EnterCriticalSection(&engine->queue_lock);
     if (engine->queue.len < NC_MAX_QUEUE_PACKETS &&
         engine->queue.bytes + length <= NC_MAX_QUEUE_BYTES) {
-        QueuedItem *head = queue_peek(&engine->queue);
+        NcQueuedPacket *head = nc_packet_queue_peek(&engine->queue);
         if (head) {
             had_head = true;
             old_head_due = head->due_ns;
         }
-        if (queue_push(&engine->queue, item)) {
-            engine->queue.bytes += length;
+        if (nc_packet_queue_push(&engine->queue, item)) {
             stats_set_queue(&engine->stats, engine->queue.len);
             inserted = true;
-            if (!had_head || due_ns < old_head_due) {
-                WakeConditionVariable(&engine->queue_cv);
-            }
+            should_wake = !had_head || due_ns < old_head_due;
         }
     }
     LeaveCriticalSection(&engine->queue_lock);
+    if (should_wake && engine->wake_event) {
+        SetEvent(engine->wake_event);
+    }
     if (!inserted) {
-        return_item(engine, item);
+        return_packet(engine, item);
     }
     return inserted;
 }
 
-static void wait_until(NcDirectionEngine *engine, uint64_t target_ns) {
-    for (;;) {
-        uint64_t now;
-        uint64_t wait_ns;
-        DWORD wait_ms;
-        if (InterlockedCompareExchange(&engine->stop, 0, 0) != 0 || stats_failed(&engine->stats)) {
+static HANDLE create_pacing_timer(void) {
+    HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                          TIMER_ALL_ACCESS);
+    if (!timer) {
+        timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+    }
+    return timer;
+}
+
+static void wait_slice_ns(HANDLE timer, HANDLE stop_event, HANDLE wake_event, uint64_t wait_ns) {
+    uint64_t clamped = wait_ns > (uint64_t)NC_WAIT_SLICE_MS * 1000000ull
+                           ? (uint64_t)NC_WAIT_SLICE_MS * 1000000ull
+                           : wait_ns;
+    if (clamped == 0) {
+        return;
+    }
+    if (timer) {
+        LARGE_INTEGER due;
+        LONGLONG ticks = (LONGLONG)((clamped + 99ull) / 100ull);
+        HANDLE handles[3];
+        DWORD count = 0;
+        if (ticks < 1) {
+            ticks = 1;
+        }
+        due.QuadPart = -ticks;
+        if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+            if (stop_event) {
+                handles[count++] = stop_event;
+            }
+            if (wake_event) {
+                handles[count++] = wake_event;
+            }
+            handles[count++] = timer;
+            WaitForMultipleObjects(count, handles, FALSE, INFINITE);
             return;
         }
-        now = nc_monotonic_ns();
-        if (now >= target_ns) {
-            return;
-        }
-        wait_ns = target_ns - now;
-        if (wait_ns > (uint64_t)NC_WAIT_SLICE_MS * 1000000ull) {
-            wait_ns = (uint64_t)NC_WAIT_SLICE_MS * 1000000ull;
-        }
-        wait_ms = (DWORD)((wait_ns + 999999ull) / 1000000ull);
+    }
+    {
+        DWORD wait_ms = (DWORD)((clamped + 999999ull) / 1000000ull);
+        HANDLE handles[2];
+        DWORD count = 0;
         if (wait_ms == 0) {
             wait_ms = 1;
         }
-        EnterCriticalSection(&engine->queue_lock);
-        if (InterlockedCompareExchange(&engine->stop, 0, 0) == 0 && !stats_failed(&engine->stats)) {
-            SleepConditionVariableCS(&engine->queue_cv, &engine->queue_lock, wait_ms);
+        if (stop_event) {
+            handles[count++] = stop_event;
         }
-        LeaveCriticalSection(&engine->queue_lock);
+        if (wake_event) {
+            handles[count++] = wake_event;
+        }
+        if (count > 0) {
+            WaitForMultipleObjects(count, handles, FALSE, wait_ms);
+        } else {
+            Sleep(wait_ms);
+        }
+    }
+}
+
+static void wait_until(NcDirectionEngine *engine, HANDLE timer, uint64_t target_ns) {
+    for (;;) {
+        uint64_t now;
+        if (InterlockedCompareExchange(&engine->stop, 0, 0) != 0 || stats_failed(&engine->stats)) {
+            return;
+        }
+        now = engine_now_ns(engine);
+        if (now >= target_ns) {
+            return;
+        }
+        wait_slice_ns(timer, engine->stop_event, NULL, target_ns - now);
     }
 }
 
 static void discard_all(NcDirectionEngine *engine) {
-    QueuedItem *item;
+    NcQueuedPacket *item;
     EnterCriticalSection(&engine->queue_lock);
-    while ((item = queue_pop(&engine->queue)) != NULL) {
-        engine->queue.bytes = engine->queue.bytes >= item->length ? engine->queue.bytes - item->length : 0;
+    while ((item = nc_packet_queue_pop(&engine->queue)) != NULL) {
         stats_add_dropped(&engine->stats);
         stats_set_queue(&engine->stats, engine->queue.len);
         LeaveCriticalSection(&engine->queue_lock);
-        return_item(engine, item);
+        return_packet(engine, item);
         EnterCriticalSection(&engine->queue_lock);
     }
     stats_set_queue(&engine->stats, 0);
@@ -495,12 +319,14 @@ static unsigned __stdcall receiver_main(void *parameter) {
     INT_PTR handle = current_handle(engine);
     if (!packet) {
         InterlockedExchange(&engine->receiver_done, 1);
-        WakeAllConditionVariable(&engine->queue_cv);
+        if (engine->wake_event) {
+            SetEvent(engine->wake_event);
+        }
         return 1;
     }
     memset(address.bytes, 0, sizeof(address.bytes));
     nc_burst_loss_init(&burst, engine->profile.burst_allow_ms, engine->profile.burst_drop_ms,
-                       nc_monotonic_ns() - engine->base_ns);
+                       engine_now_ns(engine));
     nc_bandwidth_scheduler_init(&scheduler);
     delay_ms = engine->profile.delay_ms > 0 ? (uint64_t)engine->profile.delay_ms : 0;
     jitter_ms = engine->profile.jitter_ms > 0 ? (uint64_t)engine->profile.jitter_ms : 0;
@@ -572,7 +398,7 @@ static unsigned __stdcall receiver_main(void *parameter) {
             }
         }
         {
-            uint64_t now = nc_monotonic_ns() - engine->base_ns;
+            uint64_t now = engine_now_ns(engine);
             if (nc_burst_loss_should_drop(&burst, now)) {
                 stats_add_dropped(&engine->stats);
                 continue;
@@ -590,8 +416,8 @@ static unsigned __stdcall receiver_main(void *parameter) {
         }
         {
             uint64_t jitter = jitter_ms > 0 ? nc_rand_inclusive(&random_state, jitter_ms) : 0;
-            uint64_t intended_delay_ns = sat_add(delay_ms, jitter) * 1000000ull;
-            uint64_t now = nc_monotonic_ns() - engine->base_ns;
+            uint64_t intended_delay_ns = nc_sat_add_u64(delay_ms, jitter) * 1000000ull;
+            uint64_t now = engine_now_ns(engine);
             NcSendPlan plan;
             if (!nc_bandwidth_scheduler_plan(&scheduler, now, intended_delay_ns, length, bandwidth,
                                              engine->max_queue_ns, &plan)) {
@@ -609,39 +435,40 @@ static unsigned __stdcall receiver_main(void *parameter) {
     }
     free(packet);
     InterlockedExchange(&engine->receiver_done, 1);
-    WakeAllConditionVariable(&engine->queue_cv);
+    if (engine->wake_event) {
+        SetEvent(engine->wake_event);
+    }
     return 0;
 }
 
 static unsigned __stdcall sender_main(void *parameter) {
     NcDirectionEngine *engine = (NcDirectionEngine *)parameter;
+    HANDLE timer = create_pacing_timer();
     uint64_t last_send_end_ns = 0;
     bool has_last = false;
     uint64_t bandwidth = engine->profile.bandwidth_kbps > 0
                              ? (uint64_t)engine->profile.bandwidth_kbps
                              : 0;
     for (;;) {
-        QueuedItem *head;
+        NcQueuedPacket *head;
         int action;
         bool stopping;
         bool failed;
+        uint64_t head_due = 0;
         EnterCriticalSection(&engine->queue_lock);
         stopping = InterlockedCompareExchange(&engine->stop, 0, 0) != 0;
         failed = stats_failed(&engine->stats);
         if (stopping || failed) {
-            QueuedItem *item = queue_pop(&engine->queue);
+            NcQueuedPacket *item = nc_packet_queue_pop(&engine->queue);
             if (item) {
-                engine->queue.bytes = engine->queue.bytes >= item->length ? engine->queue.bytes - item->length : 0;
                 stats_set_queue(&engine->stats, engine->queue.len);
                 LeaveCriticalSection(&engine->queue_lock);
-                if (failed || stopping) {
-                    if (failed) {
-                        stats_add_dropped(&engine->stats);
-                    } else if (!reporter_send(engine, item->data, (UINT)item->length, item->address)) {
-                        /* failure already counted */
-                    }
+                if (failed) {
+                    stats_add_dropped(&engine->stats);
+                } else if (!reporter_send(engine, item->data, (UINT)item->length, item->address)) {
+                    /* failure already counted */
                 }
-                return_item(engine, item);
+                return_packet(engine, item);
                 continue;
             }
             if (InterlockedCompareExchange(&engine->receiver_done, 0, 0) != 0) {
@@ -649,26 +476,28 @@ static unsigned __stdcall sender_main(void *parameter) {
                 break;
             }
             LeaveCriticalSection(&engine->queue_lock);
-            EnterCriticalSection(&engine->queue_lock);
-            if (InterlockedCompareExchange(&engine->stop, 0, 0) == 0 && !stats_failed(&engine->stats)) {
-                SleepConditionVariableCS(&engine->queue_cv, &engine->queue_lock, NC_WAIT_SLICE_MS);
+            if (engine->wake_event) {
+                WaitForSingleObject(engine->wake_event, NC_WAIT_SLICE_MS);
+            } else {
+                Sleep(1);
             }
-            LeaveCriticalSection(&engine->queue_lock);
             continue;
         }
         {
-            uint64_t now = nc_monotonic_ns() - engine->base_ns;
-            head = queue_peek(&engine->queue);
+            uint64_t now = engine_now_ns(engine);
+            head = nc_packet_queue_peek(&engine->queue);
             if (head && head->expires_ns > 0 && now > head->expires_ns) {
                 action = 1;
             } else if (head && head->due_ns > now) {
                 action = 2;
+                head_due = head->due_ns;
             } else if (head) {
                 action = 3;
             } else if (InterlockedCompareExchange(&engine->receiver_done, 0, 0) != 0) {
                 action = 0;
             } else {
                 action = 2;
+                head_due = 0;
             }
         }
         if (action == 0) {
@@ -676,60 +505,52 @@ static unsigned __stdcall sender_main(void *parameter) {
             break;
         }
         if (action == 1) {
-            QueuedItem *item = queue_pop(&engine->queue);
-            engine->queue.bytes = engine->queue.bytes >= item->length ? engine->queue.bytes - item->length : 0;
+            NcQueuedPacket *item = nc_packet_queue_pop(&engine->queue);
             stats_set_queue(&engine->stats, engine->queue.len);
             LeaveCriticalSection(&engine->queue_lock);
             stats_add_dropped(&engine->stats);
-            return_item(engine, item);
+            return_packet(engine, item);
             continue;
         }
         if (action == 2) {
-            uint64_t now = nc_monotonic_ns() - engine->base_ns;
-            uint64_t wait_ns = head ? (head->due_ns > now ? head->due_ns - now : 0)
-                                    : (uint64_t)NC_WAIT_SLICE_MS * 1000000ull;
-            DWORD wait_ms;
-            if (wait_ns > (uint64_t)NC_WAIT_SLICE_MS * 1000000ull) {
-                wait_ns = (uint64_t)NC_WAIT_SLICE_MS * 1000000ull;
-            }
-            wait_ms = (DWORD)((wait_ns + 999999ull) / 1000000ull);
-            if (wait_ms == 0) {
-                wait_ms = 1;
-            }
-            SleepConditionVariableCS(&engine->queue_cv, &engine->queue_lock, wait_ms);
+            uint64_t now = engine_now_ns(engine);
+            uint64_t wait_ns = head_due > 0
+                                   ? (head_due > now ? head_due - now : 0)
+                                   : (uint64_t)NC_WAIT_SLICE_MS * 1000000ull;
             LeaveCriticalSection(&engine->queue_lock);
+            wait_slice_ns(timer, engine->stop_event, engine->wake_event, wait_ns);
             continue;
         }
         {
-            QueuedItem *item = queue_pop(&engine->queue);
+            NcQueuedPacket *item = nc_packet_queue_pop(&engine->queue);
             uint64_t packet_ns;
             uint64_t send_at;
             bool expired;
-            engine->queue.bytes = engine->queue.bytes >= item->length ? engine->queue.bytes - item->length : 0;
             stats_set_queue(&engine->stats, engine->queue.len);
             LeaveCriticalSection(&engine->queue_lock);
             packet_ns = nc_packet_service_ns(item->length, bandwidth);
             send_at = item->due_ns;
             if (bandwidth > 0) {
                 send_at = nc_paced_send_time(send_at, has_last, last_send_end_ns,
-                                             nc_monotonic_ns() - engine->base_ns);
+                                             engine_now_ns(engine));
             }
-            wait_until(engine, send_at);
+            wait_until(engine, timer, send_at);
             stopping = InterlockedCompareExchange(&engine->stop, 0, 0) != 0;
             failed = stats_failed(&engine->stats);
-            expired = !stopping && item->expires_ns > 0 &&
-                      (nc_monotonic_ns() - engine->base_ns) > item->expires_ns;
+            expired = !stopping && item->expires_ns > 0 && engine_now_ns(engine) > item->expires_ns;
             if (failed || expired) {
                 stats_add_dropped(&engine->stats);
             } else if (reporter_send(engine, item->data, (UINT)item->length, item->address)) {
                 if (bandwidth > 0) {
-                    last_send_end_ns = sat_add(send_at, packet_ns);
+                    last_send_end_ns = nc_sat_add_u64(send_at, packet_ns);
                     has_last = true;
                 }
             }
-            return_item(engine, item);
-            continue;
+            return_packet(engine, item);
         }
+    }
+    if (timer) {
+        CloseHandle(timer);
     }
     return 0;
 }
@@ -756,8 +577,15 @@ NcDirectionEngine *nc_direction_new(const char *display_name, const char *filter
     engine->needs_queue = profile && (profile->delay_ms > 0 || profile->jitter_ms > 0 ||
                                       profile->bandwidth_kbps > 0);
     InitializeCriticalSection(&engine->queue_lock);
-    InitializeConditionVariable(&engine->queue_cv);
     InitializeCriticalSection(&engine->pool_lock);
+    nc_packet_queue_init(&engine->queue);
+    nc_packet_pool_init(&engine->pool);
+    engine->stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    engine->wake_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!engine->stop_event || !engine->wake_event) {
+        nc_direction_free(engine);
+        return NULL;
+    }
     return engine;
 }
 
@@ -791,19 +619,22 @@ bool nc_direction_start(NcDirectionEngine *engine, NcErr *err) {
         return nc_fail(err, "启动%s接收线程失败（Win32 错误 %lu）。", engine->display,
                        (unsigned long)code);
     }
-    engine->sender_thread = (HANDLE)_beginthreadex(NULL, 0, sender_main, engine, 0, NULL);
-    if (!engine->sender_thread) {
-        DWORD code = GetLastError();
-        InterlockedExchange(&engine->stop, 1);
-        nc_windivert_shutdown(handle, NC_WINDIVERT_SHUTDOWN_RECV);
-        WakeAllConditionVariable(&engine->queue_cv);
-        WaitForSingleObject(engine->receiver_thread, INFINITE);
-        clear_thread(&engine->receiver_thread);
-        nc_windivert_close(handle);
-        InterlockedExchange64(&engine->windivert_handle, 0);
-        discard_all(engine);
-        return nc_fail(err, "启动%s发送线程失败（Win32 错误 %lu）。", engine->display,
-                       (unsigned long)code);
+    if (engine->needs_queue) {
+        engine->sender_thread = (HANDLE)_beginthreadex(NULL, 0, sender_main, engine, 0, NULL);
+        if (!engine->sender_thread) {
+            DWORD code = GetLastError();
+            InterlockedExchange(&engine->stop, 1);
+            SetEvent(engine->stop_event);
+            SetEvent(engine->wake_event);
+            nc_windivert_shutdown(handle, NC_WINDIVERT_SHUTDOWN_RECV);
+            WaitForSingleObject(engine->receiver_thread, INFINITE);
+            clear_thread(&engine->receiver_thread);
+            nc_windivert_close(handle);
+            InterlockedExchange64(&engine->windivert_handle, 0);
+            discard_all(engine);
+            return nc_fail(err, "启动%s发送线程失败（Win32 错误 %lu）。", engine->display,
+                           (unsigned long)code);
+        }
     }
     engine->started = true;
     return true;
@@ -815,6 +646,12 @@ void nc_direction_stop(NcDirectionEngine *engine) {
         return;
     }
     InterlockedExchange(&engine->stop, 1);
+    if (engine->stop_event) {
+        SetEvent(engine->stop_event);
+    }
+    if (engine->wake_event) {
+        SetEvent(engine->wake_event);
+    }
     handle = current_handle(engine);
     if (handle) {
         if (!nc_windivert_shutdown(handle, NC_WINDIVERT_SHUTDOWN_RECV)) {
@@ -822,7 +659,6 @@ void nc_direction_stop(NcDirectionEngine *engine) {
             InterlockedExchange64(&engine->windivert_handle, 0);
         }
     }
-    WakeAllConditionVariable(&engine->queue_cv);
     if (engine->receiver_thread) {
         WaitForSingleObject(engine->receiver_thread, INFINITE);
         clear_thread(&engine->receiver_thread);
@@ -840,24 +676,18 @@ void nc_direction_stop(NcDirectionEngine *engine) {
 }
 
 void nc_direction_free(NcDirectionEngine *engine) {
-    size_t index;
     if (!engine) {
         return;
     }
     nc_direction_stop(engine);
-    while (engine->queue.len > 0) {
-        QueuedItem *item = queue_pop(&engine->queue);
-        if (item) {
-            free(item->data);
-            free(item);
-        }
+    nc_packet_queue_free(&engine->queue);
+    nc_packet_pool_free(&engine->pool);
+    if (engine->stop_event) {
+        CloseHandle(engine->stop_event);
     }
-    free(engine->queue.items);
-    for (index = 0; index < engine->pool.len; index++) {
-        free(engine->pool.items[index]->data);
-        free(engine->pool.items[index]);
+    if (engine->wake_event) {
+        CloseHandle(engine->wake_event);
     }
-    free(engine->pool.items);
     DeleteCriticalSection(&engine->queue_lock);
     DeleteCriticalSection(&engine->pool_lock);
     free(engine->filter);

@@ -4,9 +4,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "hotkey.h"
-#include "json.h"
-#include "util.h"
+#include "core/err.h"
+#include "core/hotkey.h"
+#include "core/json.h"
+#include "core/str.h"
 
 #define NC_MAX_PROCESS_COUNT 64
 #define NC_CONFIG_MAX_BYTES (1024u * 1024u)
@@ -87,6 +88,8 @@ void nc_direction_clamp(NcDirectionProfile *direction);
 bool nc_profile_all_zero(const NcProfile *profile);
 bool nc_profile_validate(const NcProfile *profile, NcErr *err);
 
+void nc_normalize_process_name(const char *raw, Str *out);
+void nc_normalize_display_name(const char *raw, Str *out);
 void nc_config_normalize_process_name(const char *raw, Str *out);
 void nc_config_normalize_display_name(const char *raw, Str *out);
 void nc_config_sanitize_process_names(NcStringList *names);

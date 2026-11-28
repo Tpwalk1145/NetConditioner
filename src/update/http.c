@@ -1,6 +1,14 @@
-#include "http.h"
+#include "update/http.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include <winhttp.h>
+
+#include "core/neturl.h"
+#include "core/str.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -111,7 +119,7 @@ static bool read_body(HINTERNET request, size_t max_body, NcHttpResponse *out, N
     return true;
 }
 
-static bool perform_request(const NcUrl *url, DWORD timeout_ms, size_t max_body,
+static bool perform_request(const NcUrl *url, uint32_t timeout_ms, size_t max_body,
                             NcHttpResponse *out, char **location, NcErr *err) {
     HINTERNET session = NULL;
     HINTERNET connect = NULL;
@@ -182,7 +190,7 @@ done:
     return ok;
 }
 
-bool nc_http_get(const char *url_text, bool https_only, DWORD timeout_ms, size_t max_body,
+bool nc_http_get(const char *url_text, bool https_only, uint32_t timeout_ms, size_t max_body,
                  NcHttpResponse *out, NcErr *err) {
     NcUrl current;
     int attempt;

@@ -1,24 +1,29 @@
 #include "test_harness.h"
 
-#include "../src/engine/process_filter.h"
-
 #include <winsock2.h>
 #include <ws2tcpip.h>
+
+#include "core/fs.h"
+#include "core/str.h"
+#include "engine/process_filter.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static void exe_stem(char *out, size_t cap) {
-    wchar_t path[32768];
+    WStr path;
     const wchar_t *file;
     char *utf8;
-    if (!nc_get_module_path(path, sizeof(path) / sizeof(path[0]))) {
+    wstr_init(&path);
+    if (!nc_get_module_path_w(&path)) {
+        wstr_free(&path);
         snprintf(out, cap, "NetConditionerTests");
         return;
     }
-    file = nc_path_file_name(path);
+    file = nc_path_file_name(wstr_cstr(&path));
     utf8 = nc_utf8_dup(file);
+    wstr_free(&path);
     if (!utf8) {
         snprintf(out, cap, "NetConditionerTests");
         return;
@@ -34,6 +39,51 @@ static void exe_stem(char *out, size_t cap) {
     free(utf8);
 }
 
+static NcNegativeKey make_neg_key(uint16_t port) {
+    NcNegativeKey key;
+    memset(&key, 0, sizeof(key));
+    key.protocol = 17;
+    key.local.family = 4;
+    key.local.address_low = 0x7F000001u;
+    key.local.port = port;
+    key.has_remote = false;
+    return key;
+}
+
+static void test_negative_cache(void) {
+    NcNegativeCache *cache = nc_negative_cache_new(16);
+    uint16_t port;
+    CHECK(cache != NULL);
+    /* Saturate well past capacity (16) to prove bounded probing never infinite-loops. */
+    for (port = 1; port <= 128; port++) {
+        NcNegativeKey k = make_neg_key(port);
+        nc_negative_cache_insert(cache, &k, 1000ull + port, 5000ull);
+    }
+    /* Most recently inserted keys remain cached before expiry. */
+    {
+        NcNegativeKey k = make_neg_key(128);
+        CHECK(nc_negative_cache_contains(cache, &k, 2000ull));
+        /* After expiry, lookup converts slot to tombstone without breaking probe chains. */
+        CHECK(!nc_negative_cache_contains(cache, &k, 10000ull));
+    }
+    /* Tombstone chain preservation test on a fresh small table. */
+    nc_negative_cache_free(cache);
+    cache = nc_negative_cache_new(16);
+    CHECK(cache != NULL);
+    {
+        NcNegativeKey a = make_neg_key(1001);
+        NcNegativeKey b = make_neg_key(1002);
+        NcNegativeKey c = make_neg_key(1003);
+        nc_negative_cache_insert(cache, &a, 100ull, 50ull);   /* expires at 150 */
+        nc_negative_cache_insert(cache, &b, 100ull, 500ull);  /* expires at 600 */
+        nc_negative_cache_insert(cache, &c, 100ull, 500ull);  /* expires at 600 */
+        CHECK(!nc_negative_cache_contains(cache, &a, 200ull));
+        CHECK(nc_negative_cache_contains(cache, &b, 200ull));
+        CHECK(nc_negative_cache_contains(cache, &c, 200ull));
+    }
+    nc_negative_cache_free(cache);
+}
+
 void test_process_filter_run(void) {
     WSADATA data;
     char name[256];
@@ -45,6 +95,7 @@ void test_process_filter_run(void) {
     NcProcessFlowFilter *filter;
     NcFlowEndpoint local;
     NcFlowEndpoint remote;
+    test_negative_cache();
     if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
         return;
     }
@@ -71,8 +122,7 @@ void test_process_filter_run(void) {
     CHECK(nc_process_filter_match(filter, 17, &local, &remote));
     nc_process_filter_free(filter);
     closesocket(socket_handle);
-    /* The filter can be created before a new UDP socket appears; an unknown flow
-       must trigger an on-demand refresh. */
+    /* Unknown flow must wake the background thread asynchronously (well before the 2s interval). */
     {
         SOCKET late_socket;
         SOCKADDR_IN late_address;
@@ -80,6 +130,8 @@ void test_process_filter_run(void) {
         uint16_t late_port;
         NcFlowEndpoint late_local;
         NcProcessFlowFilter *late_filter;
+        bool matched = false;
+        int attempt;
         late_filter = nc_process_filter_new(names, 1);
         CHECK(late_filter != NULL);
         Sleep(150);
@@ -95,7 +147,14 @@ void test_process_filter_run(void) {
         late_local.address_high = 0;
         late_local.address_low = 0x7F000001u;
         late_local.port = late_port;
-        CHECK(nc_process_filter_match(late_filter, 17, &late_local, &remote));
+        for (attempt = 0; attempt < 40; attempt++) {
+            if (nc_process_filter_match(late_filter, 17, &late_local, &remote)) {
+                matched = true;
+                break;
+            }
+            Sleep(15);
+        }
+        CHECK(matched);
         nc_process_filter_free(late_filter);
         closesocket(late_socket);
     }

@@ -1,10 +1,11 @@
-#include "coordinator.h"
+#include "update/coordinator.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "neturl.h"
+#include "core/neturl.h"
+#include "core/time.h"
 
 void nc_tick_outcome_free(NcTickOutcome *outcome) {
     if (!outcome) {
@@ -12,6 +13,7 @@ void nc_tick_outcome_free(NcTickOutcome *outcome) {
     }
     free(outcome->error);
     nc_update_manifest_free(&outcome->manifest);
+    wstr_free(&outcome->installer);
     memset(outcome, 0, sizeof(*outcome));
 }
 
@@ -57,6 +59,7 @@ void nc_coordinator_tick(const char *feed_url, const NcVersion *current,
         return;
     }
     memset(outcome, 0, sizeof(*outcome));
+    wstr_init(&outcome->installer);
     nc_url_redact(feed_url, redacted, sizeof(redacted));
     {
         char message[2200];
@@ -90,11 +93,10 @@ void nc_coordinator_tick(const char *feed_url, const NcVersion *current,
             snprintf(message, sizeof(message), "发现新版本 %s，开始下载。", version_text);
             nc_update_log(message);
         }
-        nc_update_payload_path(version_text, outcome->installer,
-                               sizeof(outcome->installer) / sizeof(outcome->installer[0]));
+        nc_update_payload_path_w(version_text, &outcome->installer);
         {
             NcErr error;
-            if (!nc_update_download(&check.manifest, outcome->installer, &error)) {
+            if (!nc_update_download(&check.manifest, wstr_cstr(&outcome->installer), &error)) {
                 char message[1400];
                 snprintf(message, sizeof(message), "下载更新包失败：%s", error.msg);
                 nc_update_log(message);

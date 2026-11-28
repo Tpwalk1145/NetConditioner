@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-#include "util.h"
+#include "core/err.h"
 
 typedef struct {
     char scheme[8];

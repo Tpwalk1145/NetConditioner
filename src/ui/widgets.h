@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "win.h"
+#include "core/win.h"
 
 #define NC_COLOR_ACCENT 0x00C06515u
 #define NC_COLOR_SURFACE 0x00FCF7F3u

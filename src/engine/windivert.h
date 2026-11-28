@@ -1,14 +1,17 @@
 #pragma once
 
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <stdbool.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
-#include "util.h"
+#include "core/err.h"
 
 #define NC_WINDIVERT_LAYER_NETWORK 0
 #define NC_WINDIVERT_SHUTDOWN_RECV 1
-#define NC_WINDIVERT_ADDRESS_SIZE 80
 #define NC_WINDIVERT_ADDRESS_BUFFER 128
 #define NC_MAX_PACKET_SIZE (65535 + 256)
 

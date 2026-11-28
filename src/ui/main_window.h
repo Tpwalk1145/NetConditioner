@@ -5,7 +5,7 @@
 #endif
 #include <windows.h>
 
-#include "widgets.h"
+#include "ui/widgets.h"
 
 #define NC_MAIN_CLIENT_WIDTH 560
 #define NC_MAIN_CLIENT_HEIGHT 574
@@ -38,7 +38,7 @@ typedef struct {
     NcMainControls controls;
 } NcMainWindow;
 
-HWND nc_main_window_create(void);
+HWND nc_main_window_create(void *param);
 void nc_main_window_init(NcMainWindow *window, HWND hwnd);
 void nc_main_window_build(NcMainWindow *window, NcWidgets *widgets, const NcFonts *fonts);
 void nc_main_window_apply_fonts(const NcMainWindow *window, const NcFonts *fonts);

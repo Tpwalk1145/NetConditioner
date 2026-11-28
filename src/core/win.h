@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "util.h"
+#include "core/str.h"
 
 #define NC_WM_APP_EVENTS (WM_APP + 1)
 #define NC_WM_APP_TRAY (WM_APP + 2)

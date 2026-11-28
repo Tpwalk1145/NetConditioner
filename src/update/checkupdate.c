@@ -1,16 +1,19 @@
-#include "checkupdate.h"
+#include "update/checkupdate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "store.h"
-#include "update.h"
-#include "version.h"
+#include "config/store.h"
+#include "core/fs.h"
+#include "core/str.h"
+#include "core/time.h"
+#include "core/version.h"
+#include "update/update.h"
 
 int nc_checkupdate_run(void) {
-    wchar_t base[32768];
-    wchar_t log_path[32768];
+    WStr base;
+    WStr log_path;
     char id[33];
     wchar_t wide_id[64];
     wchar_t log_name[256];
@@ -20,22 +23,24 @@ int nc_checkupdate_run(void) {
     Str lines;
     char version_text[64];
     int exit_code = 1;
+    wstr_init(&base);
+    wstr_init(&log_path);
     nc_store_init(&store);
     if (!nc_store_load(&store, &config, warning, sizeof(warning))) {
+        nc_store_free(&store);
         return 1;
     }
-    if (!nc_env_absolute_dir(L"TEMP", base, sizeof(base) / sizeof(base[0]))) {
-        DWORD length = GetTempPathW(sizeof(base) / sizeof(base[0]), base);
-        if (length == 0) {
-            nc_config_free(&config);
-            return 1;
-        }
+    nc_store_free(&store);
+    if (!nc_temp_dir_w(&base)) {
+        nc_config_free(&config);
+        wstr_free(&base);
+        return 1;
     }
     nc_new_id(id);
     nc_write_utf8(wide_id, sizeof(wide_id) / sizeof(wide_id[0]), id);
     swprintf(log_name, sizeof(log_name) / sizeof(log_name[0]),
              L"NetConditioner-update-check-%ls.log", wide_id);
-    nc_path_join(log_path, sizeof(log_path) / sizeof(log_path[0]), base, log_name);
+    nc_path_join_w(&log_path, wstr_cstr(&base), log_name);
     str_init(&lines);
     nc_version_display(version_text, sizeof(version_text));
     {
@@ -90,10 +95,12 @@ int nc_checkupdate_run(void) {
         NcErr error;
         void *data = str_take(&lines);
         if (data) {
-            nc_write_file(log_path, data, strlen((char *)data), &error);
+            nc_write_file(wstr_cstr(&log_path), data, strlen((char *)data), &error);
             free(data);
         }
     }
+    wstr_free(&log_path);
+    wstr_free(&base);
     nc_config_free(&config);
     return exit_code;
 }

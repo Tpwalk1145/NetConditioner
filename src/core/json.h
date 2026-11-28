@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#include "util.h"
+#include "core/err.h"
+#include "core/str.h"
 
 typedef enum {
     JSON_NULL = 0,

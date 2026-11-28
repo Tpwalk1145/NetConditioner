@@ -1,8 +1,14 @@
 #include "test_harness.h"
 
-#include "../src/update/coordinator.h"
-#include "../src/update/selfupdate.h"
-#include "../src/update/update.h"
+#include "update/coordinator.h"
+#include "core/str.h"
+#include "update/selfupdate.h"
+#include "update/update.h"
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,9 +60,11 @@ void test_update_run(void) {
     }
 
     {
-        wchar_t path[32768];
-        nc_update_payload_path("9.9.9", path, sizeof(path) / sizeof(path[0]));
-        CHECK(wcsstr(path, L"NetConditioner-9.9.9-win-x64.exe") != NULL);
+        WStr path;
+        wstr_init(&path);
+        CHECK(nc_update_payload_path_w("9.9.9", &path));
+        CHECK(wcsstr(wstr_cstr(&path), L"NetConditioner-9.9.9-win-x64.exe") != NULL);
+        wstr_free(&path);
     }
 
     {

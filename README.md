@@ -211,24 +211,55 @@ build.cmd -Pause
 
 ## 项目结构
 
+项目采用严格的单向分层架构（无循环依赖：`core` → `config` → `engine` / `update` → `ui` → `app` → `main.c`）：
+
 ```text
 src/
-├── main.c              入口与命令行参数分流
-├── app.c               应用状态机与主窗口消息循环
-├── win.c               Win32 API 薄封装
-├── util.c              UTF-8/UTF-16 转换、字符串、路径、时间与哈希
-├── json.c              JSON DOM 解析与序列化
-├── config.c            配置模型、清洗与校验
-├── store.c             配置文件读写、原子写入与损坏恢复
-├── hotkey.c            全局热键校验与格式化
-├── version.c           版本号解析与比较
-├── neturl.c            URL 安全校验、脱敏与 SHA256 规范化
-├── licenses.c          内嵌许可文本导出
-├── selftest.c          管理员端到端自测
-├── engine/             弱网引擎（WinDivert 加载、方向队列、流解析、进程过滤）
-├── ui/                 原生 Win32 界面（主窗口、控件、托盘、配置编辑、进程选择、设置）
-└── update/             云更新检查、协调调度、WinHTTP 下载与自更新助手
-tests/                  离线单元测试（无需管理员权限）
+├── core/               基础原语层（零业务依赖）
+│   ├── err.c           统一错误对象 NcErr
+│   ├── str.c           UTF-8 Str / 动态 UTF-16 WStr、编码转换与字符串列表
+│   ├── fs.c            动态宽路径拼接、目录递归清理、原子文件读写与临时文件
+│   ├── hash.c          FNV-1a 与 Windows CNG SHA256
+│   ├── time.c          单调时钟、时间格式化、PRNG 与唯一 ID
+│   ├── json.c          JSON DOM 解析、合并与序列化
+│   ├── version.c       版本号解析与比较
+│   ├── hotkey.c        全局热键校验与格式化
+│   ├── neturl.c        URL 安全校验、脱敏与 SHA256 规范化
+│   └── win.c           Win32 API 薄封装（窗口、GDI、DPI、提权与单实例互斥）
+├── config/             配置领域与持久化层
+│   ├── config.c        配置模型、进程名规范化、清洗与校验
+│   └── store.c         配置文件读写、原子替换、进程间互斥与损坏备份恢复
+├── engine/             弱网引擎层
+│   ├── flow.c          IPv4/IPv6 + TCP/UDP 数据包五元组解析与哈希
+│   ├── scheduler.c     纯算法调度器（突发丢包、带宽整形、最小堆队列与包对象池）
+│   ├── events.c        引擎事件队列与实时统计快照
+│   ├── windivert.c     WinDivert 动态释放与 API 加载
+│   ├── process_filter.c 进程枚举、异步事件刷新连接表与有界墓碑负缓存
+│   ├── direction.c     单方向收发管线（高精度可等待定时器与零忙等停止）
+│   └── engine.c        上下行弱网引擎门面
+├── update/             云更新与自更新层
+│   ├── update_log.c    更新目录安全 ACL、日志轮转与旧包清理
+│   ├── http.c          WinHTTP 安全请求与重定向校验
+│   ├── selfupdate.c    自更新助手模式、备份替换与失败回滚
+│   ├── update.c        更新清单校验与 SHA256 复核下载
+│   ├── coordinator.c   24 小时冷却与失败重试策略
+│   ├── service.c       后台异步更新服务与空闲安装状态机
+│   └── checkupdate.c   --check-update 命令行检查实现
+├── ui/                 原生 Win32 界面层（完全解耦 app，零反向依赖）
+│   ├── ui_host.c       UI 宿主上下文与公共自绘/配色处理
+│   ├── widgets.c       自绘面板/文本/按钮、数值输入与列表控件
+│   ├── tray.c          系统托盘图标、菜单与气泡通知
+│   ├── main_window.c   主窗口布局与控件构建
+│   ├── profile_editor.c 独立配置方案编辑弹窗（GWLP_USERDATA + 独立 WndProc）
+│   ├── process_selector.c 独立目标进程选择弹窗
+│   └── settings.c      独立设置弹窗（独立快捷键子类化绑定）
+├── app/                应用组合与命令层
+│   ├── engine_runner.c 引擎异步启停线程与最长运行时间控制
+│   ├── app.c           组合根、主窗口消息循环与动作编排
+│   ├── licenses.c      --licenses 许可文本导出
+│   └── selftest.c      --self-test 管理员端到端验证
+└── main.c              入口、命令行分流与管理员/单实例检查
+tests/                  离线单元测试（仅链接 core/config/engine/update，无需管理员权限）
 third_party/WinDivert/  随包内嵌的 WinDivert 2.2.2 二进制与许可
 ```
 

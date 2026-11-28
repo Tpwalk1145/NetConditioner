@@ -1,11 +1,11 @@
-#include "widgets.h"
+#include "ui/widgets.h"
 
 #include <commctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "util.h"
+#include "core/str.h"
 
 static const struct {
     const wchar_t *family;

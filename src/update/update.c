@@ -1,16 +1,15 @@
-#include "update.h"
+#include "update/update.h"
 
-#include <bcrypt.h>
-#include <knownfolders.h>
-#include <sddl.h>
-#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "http.h"
-#include "neturl.h"
-#include "selfupdate.h"
+#include "core/fs.h"
+#include "core/json.h"
+#include "core/neturl.h"
+#include "core/str.h"
+#include "update/http.h"
+#include "update/selfupdate.h"
 
 #define NC_MAX_MANIFEST_BYTES (64u * 1024u)
 #define NC_MAX_INSTALLER_BYTES (300ull * 1024ull * 1024ull)
@@ -28,214 +27,6 @@ void nc_update_manifest_free(NcUpdateManifest *manifest) {
     free(manifest->installer.url);
     free(manifest->installer.sha256);
     memset(manifest, 0, sizeof(*manifest));
-}
-
-void nc_sha256_hex(const void *data, size_t length, char out[65]) {
-    BCRYPT_ALG_HANDLE algorithm = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    unsigned char digest[32];
-    DWORD digest_size = 0;
-    DWORD result_size = 0;
-    size_t index;
-    if (!out) {
-        return;
-    }
-    out[0] = 0;
-    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, NULL, 0))) {
-        return;
-    }
-    if (!BCRYPT_SUCCESS(BCryptGetProperty(algorithm, BCRYPT_HASH_LENGTH, (PUCHAR)&digest_size,
-                                          sizeof(digest_size), &result_size, 0)) ||
-        digest_size != sizeof(digest)) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return;
-    }
-    if (!BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, NULL, 0, NULL, 0, 0))) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return;
-    }
-    if (length > 0) {
-        size_t offset = 0;
-        while (offset < length) {
-            ULONG chunk = (ULONG)((length - offset) > 0x40000000u ? 0x40000000u : (length - offset));
-            if (!BCRYPT_SUCCESS(BCryptHashData(hash, (PUCHAR)data + offset, chunk, 0))) {
-                BCryptDestroyHash(hash);
-                BCryptCloseAlgorithmProvider(algorithm, 0);
-                return;
-            }
-            offset += chunk;
-        }
-    }
-    if (!BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, (ULONG)sizeof(digest), 0))) {
-        BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return;
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    for (index = 0; index < sizeof(digest); index++) {
-        snprintf(out + index * 2, 3, "%02X", digest[index]);
-    }
-}
-
-bool nc_sha256_file(const wchar_t *path, uint64_t *size, char out[65], NcErr *err) {
-    HANDLE file;
-    BCRYPT_ALG_HANDLE algorithm = NULL;
-    BCRYPT_HASH_HANDLE hash = NULL;
-    unsigned char digest[32];
-    unsigned char buffer[64 * 1024];
-    uint64_t total = 0;
-    size_t index;
-    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file == INVALID_HANDLE_VALUE) {
-        return nc_fail(err, "打开文件失败（Win32 错误 %lu）。", (unsigned long)GetLastError());
-    }
-    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, NULL, 0))) {
-        CloseHandle(file);
-        return nc_fail(err, "初始化 SHA256 失败。");
-    }
-    if (!BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, NULL, 0, NULL, 0, 0))) {
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        CloseHandle(file);
-        return nc_fail(err, "初始化 SHA256 失败。");
-    }
-    for (;;) {
-        DWORD read = 0;
-        if (!ReadFile(file, buffer, sizeof(buffer), &read, NULL)) {
-            DWORD code = GetLastError();
-            BCryptDestroyHash(hash);
-            BCryptCloseAlgorithmProvider(algorithm, 0);
-            CloseHandle(file);
-            return nc_fail(err, "读取文件失败（Win32 错误 %lu）。", (unsigned long)code);
-        }
-        if (read == 0) {
-            break;
-        }
-        if (!BCRYPT_SUCCESS(BCryptHashData(hash, buffer, read, 0))) {
-            BCryptDestroyHash(hash);
-            BCryptCloseAlgorithmProvider(algorithm, 0);
-            CloseHandle(file);
-            return nc_fail(err, "计算 SHA256 失败。");
-        }
-        total += read;
-    }
-    CloseHandle(file);
-    if (!BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, (ULONG)sizeof(digest), 0))) {
-        BCryptDestroyHash(hash);
-        BCryptCloseAlgorithmProvider(algorithm, 0);
-        return nc_fail(err, "计算 SHA256 失败。");
-    }
-    BCryptDestroyHash(hash);
-    BCryptCloseAlgorithmProvider(algorithm, 0);
-    for (index = 0; index < sizeof(digest); index++) {
-        snprintf(out + index * 2, 3, "%02X", digest[index]);
-    }
-    if (size) {
-        *size = total;
-    }
-    return true;
-}
-
-bool nc_update_directory(wchar_t *out, size_t cap) {
-    wchar_t base[32768];
-    wchar_t directory[32768];
-    if (!out || cap == 0) {
-        return false;
-    }
-    out[0] = 0;
-    if (!nc_env_absolute_dir(L"LOCALAPPDATA", base, sizeof(base) / sizeof(base[0]))) {
-        if (!nc_known_folder(&FOLDERID_LocalAppData, base, sizeof(base) / sizeof(base[0]))) {
-            return false;
-        }
-    }
-    if (!nc_path_join(directory, sizeof(directory) / sizeof(directory[0]), base, L"NetConditioner")) {
-        return false;
-    }
-    return nc_path_join(out, cap, directory, L"update");
-}
-
-static bool restrict_directory_to_user(const wchar_t *directory) {
-    PSECURITY_DESCRIPTOR descriptor = NULL;
-    BOOL result;
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)", SDDL_REVISION_1, &descriptor, NULL)) {
-        return false;
-    }
-    result = SetFileSecurityW(directory,
-                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                              descriptor);
-    LocalFree(descriptor);
-    return result != 0;
-}
-
-bool nc_update_ensure_directory(wchar_t *out, size_t cap, NcErr *err) {
-    wchar_t directory[32768];
-    if (!nc_update_directory(directory, sizeof(directory) / sizeof(directory[0]))) {
-        return nc_fail(err, "无法确定更新目录。");
-    }
-    if (!nc_make_dirs(directory)) {
-        return nc_fail(err, "创建更新目录失败（Win32 错误 %lu）。", (unsigned long)GetLastError());
-    }
-    restrict_directory_to_user(directory);
-    if (out) {
-        nc_copy_wide(out, cap, directory);
-    }
-    return true;
-}
-
-void nc_update_log(const char *message) {
-    wchar_t directory[32768];
-    wchar_t path[32768];
-    char line[2048];
-    char stamp[64];
-    NcErr error;
-    ULARGE_INTEGER size;
-    nc_update_ensure_directory(directory, sizeof(directory) / sizeof(directory[0]), &error);
-    if (!nc_path_join(path, sizeof(path) / sizeof(path[0]), directory, L"update.log")) {
-        return;
-    }
-    {
-        WIN32_FILE_ATTRIBUTE_DATA data;
-        memset(&data, 0, sizeof(data));
-        if (GetFileAttributesExW(path, GetFileExInfoStandard, &data)) {
-            size.LowPart = data.nFileSizeLow;
-            size.HighPart = data.nFileSizeHigh;
-            if (size.QuadPart > 512 * 1024) {
-                wchar_t backup[32768];
-                swprintf(backup, sizeof(backup) / sizeof(backup[0]), L"%ls.old", path);
-                MoveFileExW(path, backup, MOVEFILE_REPLACE_EXISTING);
-            }
-        }
-    }
-    nc_format_local_iso_ms(stamp, sizeof(stamp));
-    snprintf(line, sizeof(line), "[%s] %s\r\n", stamp, message ? message : "");
-    nc_append_file(path, line, strlen(line), &error);
-}
-
-bool nc_update_is_dry_run(void) {
-    char value[16];
-    DWORD length = GetEnvironmentVariableA("NC_UPDATE_DRY_RUN", value, sizeof(value));
-    return length == 1 && value[0] == '1';
-}
-
-void nc_update_payload_path(const char *version, wchar_t *out, size_t cap) {
-    char normalized[32];
-    wchar_t wide_name[128];
-    wchar_t directory[32768];
-    if (!out || cap == 0) {
-        return;
-    }
-    out[0] = 0;
-    if (!nc_version_normalize(version, normalized, sizeof(normalized))) {
-        snprintf(normalized, sizeof(normalized), "unknown");
-    }
-    swprintf(wide_name, sizeof(wide_name) / sizeof(wide_name[0]),
-             L"NetConditioner-%hs-win-x64.exe", normalized);
-    if (!nc_update_directory(directory, sizeof(directory) / sizeof(directory[0]))) {
-        return;
-    }
-    nc_path_join(out, cap, directory, wide_name);
 }
 
 static char *dup_json_string(const JsonValue *object, const char *key) {
@@ -258,8 +49,6 @@ bool nc_update_parse_manifest(const char *json, size_t length, NcUpdateManifest 
         return nc_fail(err, "更新信息不是有效的 JSON。");
     }
     if (!json_get_i32(root, "schemaVersion", &schema_version) || schema_version != 2) {
-        int32_t raw = 0;
-        json_get_i32(root, "schemaVersion", &raw);
         json_free(root);
         return nc_fail(err, "不支持的更新信息版本：%d。", (int)schema_version);
     }
@@ -428,9 +217,10 @@ bool nc_update_download(const NcUpdateManifest *manifest, const wchar_t *destina
     char expected[65];
     uint64_t expected_size;
     char digest[65];
-    wchar_t parent[32768];
-    wchar_t staging[32768];
+    WStr parent;
+    WStr staging;
     HANDLE handle = INVALID_HANDLE_VALUE;
+    bool ok = false;
     if (!manifest || !manifest->has_installer || !manifest->installer.url ||
         !manifest->installer.sha256 || !destination) {
         return nc_fail(err, "更新包信息无效。");
@@ -446,46 +236,52 @@ bool nc_update_download(const NcUpdateManifest *manifest, const wchar_t *destina
         return nc_fail(err, "%s", error.msg);
     }
     loopback = nc_ieq_ascii(url.scheme, "http");
-    parent[0] = 0;
-    nc_path_parent(destination, parent, sizeof(parent) / sizeof(parent[0]));
-    if (parent[0]) {
-        nc_make_dirs(parent);
+    wstr_init(&parent);
+    wstr_init(&staging);
+    if (nc_path_parent_w(destination, &parent) && !wstr_empty(&parent)) {
+        nc_make_dirs(wstr_cstr(&parent));
     }
     if (!nc_http_get(manifest->installer.url, !loopback, NC_DOWNLOAD_TIMEOUT_MS,
                      (size_t)NC_MAX_INSTALLER_BYTES, &response, &error)) {
-        return nc_fail(err, "%s", error.msg);
+        nc_err_set(err, "%s", error.msg);
+        goto done;
     }
     if (response.status < 200 || response.status >= 300) {
         int status = response.status;
         nc_http_response_free(&response);
-        return nc_fail(err, "服务器返回 HTTP %d。", status);
+        nc_err_set(err, "服务器返回 HTTP %d。", status);
+        goto done;
     }
     if (response.body_size == 0) {
         nc_http_response_free(&response);
-        return nc_fail(err, "更新包为空。");
+        nc_err_set(err, "更新包为空。");
+        goto done;
     }
     if (response.body_size != expected_size) {
         size_t actual = response.body_size;
         nc_http_response_free(&response);
-        return nc_fail(err, "文件大小 %llu 与清单 %llu 不一致。", (unsigned long long)actual,
-                       (unsigned long long)expected_size);
+        nc_err_set(err, "文件大小 %llu 与清单 %llu 不一致。", (unsigned long long)actual,
+                   (unsigned long long)expected_size);
+        goto done;
     }
     nc_sha256_hex(response.body, response.body_size, digest);
     if (!nc_ieq_ascii(digest, expected)) {
         nc_http_response_free(&response);
-        return nc_fail(err, "SHA256 不匹配。");
+        nc_err_set(err, "SHA256 不匹配。");
+        goto done;
     }
-    if (!nc_create_temp_file(parent[0] ? parent : L".", L"nc-download", response.body,
-                             response.body_size, staging, sizeof(staging) / sizeof(staging[0]),
-                             &handle, &error)) {
+    if (!nc_create_temp_file_w(wstr_empty(&parent) ? L"." : wstr_cstr(&parent), L"nc-download",
+                               response.body, response.body_size, &staging, &handle, &error)) {
         nc_http_response_free(&response);
-        return nc_fail(err, "%s", error.msg);
+        nc_err_set(err, "%s", error.msg);
+        goto done;
     }
     CloseHandle(handle);
     nc_http_response_free(&response);
-    if (!nc_replace_file(staging, destination, &error)) {
-        nc_remove_file(staging);
-        return nc_fail(err, "%s", error.msg);
+    if (!nc_replace_file(wstr_cstr(&staging), destination, &error)) {
+        nc_remove_file(wstr_cstr(&staging));
+        nc_err_set(err, "%s", error.msg);
+        goto done;
     }
     {
         uint64_t final_size = 0;
@@ -493,7 +289,8 @@ bool nc_update_download(const NcUpdateManifest *manifest, const wchar_t *destina
         if (!nc_sha256_file(destination, &final_size, final_hash, &error) ||
             final_size != expected_size || !nc_ieq_ascii(final_hash, expected)) {
             nc_remove_file(destination);
-            return nc_fail(err, "最终更新包复核失败。");
+            nc_err_set(err, "最终更新包复核失败。");
+            goto done;
         }
     }
     nc_selfupdate_remove_zone_identifier(destination);
@@ -503,7 +300,11 @@ bool nc_update_download(const NcUpdateManifest *manifest, const wchar_t *destina
                  (unsigned long long)expected_size);
         nc_update_log(message);
     }
-    return true;
+    ok = true;
+done:
+    wstr_free(&staging);
+    wstr_free(&parent);
+    return ok;
 }
 
 bool nc_update_apply_self_update(const wchar_t *new_file) {
@@ -529,44 +330,4 @@ bool nc_update_apply_self_update(const wchar_t *new_file) {
     }
     nc_update_log("已启动自更新。");
     return true;
-}
-
-void nc_update_cleanup_old_files(void) {
-    wchar_t directory[32768];
-    wchar_t pattern[32768];
-    WIN32_FIND_DATAW data;
-    HANDLE find;
-    FILETIME now;
-    ULARGE_INTEGER cutoff;
-    GetSystemTimeAsFileTime(&now);
-    cutoff.LowPart = now.dwLowDateTime;
-    cutoff.HighPart = now.dwHighDateTime;
-    cutoff.QuadPart = cutoff.QuadPart > 7ull * 24ull * 3600ull * 10000000ull
-                          ? cutoff.QuadPart - 7ull * 24ull * 3600ull * 10000000ull
-                          : 0;
-    if (!nc_update_directory(directory, sizeof(directory) / sizeof(directory[0]))) {
-        return;
-    }
-    if (!nc_path_join(pattern, sizeof(pattern) / sizeof(pattern[0]), directory, L"*")) {
-        return;
-    }
-    find = FindFirstFileW(pattern, &data);
-    if (find == INVALID_HANDLE_VALUE) {
-        return;
-    }
-    do {
-        ULARGE_INTEGER written;
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            continue;
-        }
-        written.LowPart = data.ftLastWriteTime.dwLowDateTime;
-        written.HighPart = data.ftLastWriteTime.dwHighDateTime;
-        if (written.QuadPart < cutoff.QuadPart) {
-            wchar_t path[32768];
-            if (nc_path_join(path, sizeof(path) / sizeof(path[0]), directory, data.cFileName)) {
-                DeleteFileW(path);
-            }
-        }
-    } while (FindNextFileW(find, &data));
-    FindClose(find);
 }

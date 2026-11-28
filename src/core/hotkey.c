@@ -1,6 +1,6 @@
-#include "hotkey.h"
+#include "core/hotkey.h"
 
-#include "util.h"
+#include "core/str.h"
 
 #include <stdio.h>
 #include <string.h>
