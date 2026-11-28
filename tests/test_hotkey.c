@@ -1,6 +1,6 @@
 #include "test_harness.h"
 
-#include "../src/hotkey.h"
+#include "core/hotkey.h"
 
 #include <string.h>
 

@@ -1,12 +1,16 @@
 #include "test_harness.h"
 
-#include "../src/util.h"
+#include "config/config.h"
+#include "core/fs.h"
+#include "core/hash.h"
+#include "core/str.h"
+#include "core/time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void test_utf( void ) {
+static void test_utf(void) {
     wchar_t *wide = nc_wide_dup("应用 ab");
     char *utf8;
     wchar_t buffer[16];
@@ -29,8 +33,10 @@ static void test_utf( void ) {
     CHECK(nc_write_utf8(buffer, 16, "hello"));
 }
 
-static void test_strings( void ) {
+static void test_strings(void) {
     Str s;
+    WStr ws;
+    wchar_t *taken;
     char text[] = "  value  ";
     str_init(&s);
     CHECK(str_add(&s, "abc"));
@@ -41,9 +47,20 @@ static void test_strings( void ) {
     CHECK(nc_istarts_ascii("Hello", "he"));
     CHECK(!nc_istarts_ascii("Hello", "lo"));
     str_free(&s);
+
+    wstr_init(&ws);
+    CHECK(wstr_empty(&ws));
+    CHECK(wstr_set_utf8(&ws, "你好"));
+    CHECK(wstr_addf(&ws, L"-%u", 123u));
+    CHECK(wcscmp(wstr_cstr(&ws), L"你好-123") == 0);
+    taken = wstr_take(&ws);
+    CHECK(taken != NULL && wcscmp(taken, L"你好-123") == 0);
+    CHECK(wstr_empty(&ws));
+    free(taken);
+    wstr_free(&ws);
 }
 
-static void test_process_names( void ) {
+static void test_process_names(void) {
     Str name;
     str_init(&name);
     nc_normalize_process_name("Chrome.EXE", &name);
@@ -61,7 +78,7 @@ static void test_process_names( void ) {
     str_free(&name);
 }
 
-static void test_hash_and_numbers( void ) {
+static void test_hash_and_numbers(void) {
     char buffer[64];
     int32_t value = 0;
     CHECK_INT(nc_fnv1a_utf8(""), (uint64_t)14695981039346656037ull);
@@ -86,9 +103,11 @@ static void test_hash_and_numbers( void ) {
     CHECK(!nc_parse_i32_digits("１２", 100, &value));
 }
 
-static void test_paths_and_time( void ) {
+static void test_paths_and_time(void) {
     wchar_t joined[512];
     wchar_t parent[512];
+    WStr wjoined;
+    WStr wparent;
     char stamp[64];
     uint64_t state = nc_random_seed();
     int i;
@@ -101,6 +120,15 @@ static void test_paths_and_time( void ) {
     CHECK(nc_path_parent(L"C:\\base\\child", parent, 512));
     CHECK(wcscmp(parent, L"C:\\base") == 0);
     CHECK(wcscmp(nc_path_file_name(L"C:\\base\\child.exe"), L"child.exe") == 0);
+    wstr_init(&wjoined);
+    wstr_init(&wparent);
+    CHECK(nc_path_join_w(&wjoined, L"C:\\base", L"sub"));
+    CHECK(nc_path_join_w(&wjoined, wstr_cstr(&wjoined), L"leaf.txt"));
+    CHECK(wcscmp(wstr_cstr(&wjoined), L"C:\\base\\sub\\leaf.txt") == 0);
+    CHECK(nc_path_parent_w(wstr_cstr(&wjoined), &wparent));
+    CHECK(wcscmp(wstr_cstr(&wparent), L"C:\\base\\sub") == 0);
+    wstr_free(&wparent);
+    wstr_free(&wjoined);
     nc_format_local_iso_ms(stamp, sizeof(stamp));
     CHECK(strlen(stamp) == 23);
     first = nc_monotonic_ns();
@@ -112,7 +140,7 @@ static void test_paths_and_time( void ) {
     CHECK(nc_rand_inclusive(&state, 0) == 0);
 }
 
-static void test_new_id( void ) {
+static void test_new_id(void) {
     char id[33];
     int i;
     nc_new_id(id);

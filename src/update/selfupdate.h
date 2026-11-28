@@ -1,12 +1,9 @@
 #pragma once
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
 #include <stdbool.h>
+#include <wchar.h>
 
-#include "util.h"
+#include "core/err.h"
 
 bool nc_selfupdate_is_helper_mode(int argc, wchar_t **argv);
 int nc_selfupdate_run_helper(int argc, wchar_t **argv);

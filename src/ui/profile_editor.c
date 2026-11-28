@@ -1,29 +1,30 @@
-#include "profile_editor.h"
+#include "ui/profile_editor.h"
 
 #include <commctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "app.h"
+#include "core/str.h"
+#include "core/time.h"
+#include "core/win.h"
 #include "ui/ids.h"
-#include "ui/main_window.h"
-#include "win.h"
 
 #define NC_EM_SETLIMITTEXT 0x00C5
 
-struct NcProfileEditor {
+typedef struct {
+    NcUiHost host;
     HWND hwnd;
-    bool closed;
     char *existing_id;
     NcStringList existing_names;
     HWND name_edit;
     NcNumberInput up[6];
     NcNumberInput down[6];
     HWND protocol_combo;
+    NcWidgets widgets;
     NcFonts fonts;
     NcEditorOutcome outcome;
-};
+} ProfileEditor;
 
 static int scale_of(int value, double scale) {
     return (int)((double)value * scale + 0.5);
@@ -55,7 +56,7 @@ static void make_default_name(const NcStringList *existing, Str *out) {
     }
 }
 
-static void load_values(NcProfileEditor *editor, const NcProfile *existing) {
+static void load_values(ProfileEditor *editor, const NcProfile *existing) {
     if (existing) {
         const NcDirectionProfile *directions[2];
         int direction_index;
@@ -64,18 +65,11 @@ static void load_values(NcProfileEditor *editor, const NcProfile *existing) {
         directions[0] = &existing->uplink;
         directions[1] = &existing->downlink;
         for (direction_index = 0; direction_index < 2; direction_index++) {
-            const NcDirectionProfile *direction = directions[direction_index];
-            const NcDirectionProfile *direction_values = direction;
-            int32_t values[6];
-            values[0] = direction_values->delay_ms;
-            values[1] = direction_values->jitter_ms;
-            values[2] = direction_values->bandwidth_kbps;
-            values[3] = direction_values->random_loss_percent;
-            values[4] = direction_values->burst_allow_ms;
-            values[5] = direction_values->burst_drop_ms;
+            const NcDirectionProfile *d = directions[direction_index];
+            int32_t values[6] = {d->delay_ms, d->jitter_ms, d->bandwidth_kbps,
+                                 d->random_loss_percent, d->burst_allow_ms, d->burst_drop_ms};
             for (row = 0; row < 6; row++) {
-                nc_number_set(direction_index == 0 ? &editor->up[row] : &editor->down[row],
-                              values[row]);
+                nc_number_set(direction_index == 0 ? &editor->up[row] : &editor->down[row], values[row]);
             }
         }
         {
@@ -96,166 +90,7 @@ static void load_values(NcProfileEditor *editor, const NcProfile *existing) {
     }
 }
 
-NcProfileEditor *nc_profile_editor_create(NcApp *app, const NcProfile *existing, bool allow_delete,
-                                          const NcStringList *existing_names) {
-    static const char *up_labels[6] = {
-        "上行延时 (ms)", "上行延时抖动 (ms)", "上行带宽 (kbps)",
-        "上行随机丢包 (%)", "上行连续丢包-放行 (ms)", "上行连续丢包-丢包 (ms)"};
-    static const char *down_labels[6] = {
-        "下行延时 (ms)", "下行延时抖动 (ms)", "下行带宽 (kbps)",
-        "下行随机丢包 (%)", "下行连续丢包-放行 (ms)", "下行连续丢包-丢包 (ms)"};
-    static const int32_t limits[6] = {60000, 60000, 1000000, 100, 600000, 600000};
-    static const int32_t increments[6] = {10, 10, 10, 1, 10, 10};
-    NcProfileEditor *editor;
-    HWND owner;
-    double preferred;
-    double scale;
-    HWND up_group;
-    HWND down_group;
-    HWND parent;
-    int row;
-    int index;
-    if (!app) {
-        return NULL;
-    }
-    owner = nc_app_main_hwnd(app);
-    preferred = nc_app_scale(app);
-    if (preferred <= 0) {
-        preferred = 1.0;
-    }
-    scale = nc_fit_dialog_scale(owner, 760, 592, preferred);
-    editor = (NcProfileEditor *)calloc(1, sizeof(NcProfileEditor));
-    if (!editor) {
-        return NULL;
-    }
-    editor->existing_id = nc_strdup(existing && existing->id ? existing->id : "");
-    nc_string_list_init(&editor->existing_names);
-    for (index = 0; existing_names && (size_t)index < existing_names->count; index++) {
-        nc_string_list_push(&editor->existing_names, existing_names->items[index]);
-    }
-    nc_fonts_init(&editor->fonts, (UINT)(scale * 96.0 + 0.5));
-    editor->hwnd = nc_create_window(L"NCProfileEditor", existing ? L"编辑配置" : L"新建配置",
-                                    NC_STYLE_DIALOG, WS_EX_CONTROLPARENT, owner, 0, NULL);
-    if (!editor->hwnd) {
-        nc_profile_editor_free(editor);
-        return NULL;
-    }
-    nc_set_window_client_size(editor->hwnd, scale_of(760, scale), scale_of(592, scale));
-    nc_center_on_owner(editor->hwnd, owner);
-    parent = editor->hwnd;
-#define S(v) scale_of((v), scale)
-    nc_widget_create_panel(nc_app_widgets(app), parent, NC_ID_EDITOR_HEADER, 0, 0, S(760), S(58),
-                           NC_COLOR_ACCENT, false, 0);
-    nc_widget_create_text(nc_app_widgets(app), parent, NC_ID_EDITOR_TITLE,
-                          existing ? "编辑配置" : "新建配置", S(20), S(14), S(400), S(30),
-                          NC_FONT_TITLE, 0x00FFFFFF, NC_COLOR_ACCENT, NC_ALIGN_LEFT, false, false);
-    nc_widget_create_text(nc_app_widgets(app), parent, NC_ID_EDITOR_NAME_LABEL, "名称", S(20), S(80),
-                          S(44), S(20), NC_FONT_BODY, NC_COLOR_TEXT_DARK, NC_COLOR_SURFACE,
-                          NC_ALIGN_LEFT, false, false);
-    editor->name_edit = nc_widget_create_edit(parent, NC_ID_EDITOR_NAME_EDIT, "", S(70), S(76),
-                                              S(670), S(27), false, NC_ALIGN_LEFT, NULL);
-    SendMessageW(editor->name_edit, NC_EM_SETLIMITTEXT, 60, 0);
-    up_group = nc_widget_create_group(parent, NC_ID_EDITOR_UP_GROUP, "上行", S(20), S(112), S(350),
-                                      S(340));
-    down_group = nc_widget_create_group(parent, NC_ID_EDITOR_DOWN_GROUP, "下行", S(390), S(112),
-                                        S(350), S(340));
-    nc_set_font(up_group, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
-    nc_set_font(down_group, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
-    for (row = 0; row < 6; row++) {
-        int y = 112 + 28 + row * 42;
-        nc_widget_create_text(nc_app_widgets(app), parent,
-                              NC_ID_EDITOR_ROW_LABEL_BASE + row, up_labels[row], S(20 + 14),
-                              S(y + 4), S(150), S(20), NC_FONT_BODY, NC_COLOR_TEXT_BUTTON,
-                              NC_COLOR_SURFACE, NC_ALIGN_LEFT, false, false);
-        nc_number_create(&editor->up[row], parent, NC_ID_EDITOR_UP_BASE + row, S(20 + 170), S(y),
-                         S(165), S(24), limits[row], increments[row]);
-        nc_set_font(editor->up[row].edit, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
-        nc_widget_create_text(nc_app_widgets(app), parent,
-                              NC_ID_EDITOR_ROW_LABEL_BASE + 10 + row, down_labels[row],
-                              S(390 + 14), S(y + 4), S(150), S(20), NC_FONT_BODY,
-                              NC_COLOR_TEXT_BUTTON, NC_COLOR_SURFACE, NC_ALIGN_LEFT, false, false);
-        nc_number_create(&editor->down[row], parent, NC_ID_EDITOR_DOWN_BASE + row, S(390 + 170),
-                         S(y), S(165), S(24), limits[row], increments[row]);
-        nc_set_font(editor->down[row].edit, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
-    }
-    nc_widget_create_text(nc_app_widgets(app), parent, NC_ID_EDITOR_PROTOCOL_LABEL, "弱网控制协议",
-                          S(20), S(470), S(110), S(20), NC_FONT_BODY, NC_COLOR_TEXT_DARK,
-                          NC_COLOR_SURFACE, NC_ALIGN_LEFT, false, false);
-    editor->protocol_combo = nc_widget_create_combo(parent, NC_ID_EDITOR_PROTOCOL_COMBO, S(130),
-                                                    S(466), S(170), S(200));
-    {
-        static const char *items[3] = {"TCP (1)", "UDP (2)", "ALL (3)"};
-        for (index = 0; index < 3; index++) {
-            wchar_t *wide = nc_wide_dup(items[index]);
-            if (wide) {
-                SendMessageW(editor->protocol_combo, CB_ADDSTRING, 0, (LPARAM)wide);
-                free(wide);
-            }
-        }
-    }
-    SendMessageW(editor->protocol_combo, CB_SETCURSEL, 2, 0);
-    nc_set_font(editor->protocol_combo, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
-    nc_widget_create_text(nc_app_widgets(app), parent, NC_ID_EDITOR_HINT,
-                          "带宽单位 kbps；随机丢包单位 %；延时 / 连续丢包单位 ms；0 表示不启用。\r\n"
-                          "连续丢包：放行 X ms、丢包 Y ms 循环；只填“丢包”表示一直丢包。上行丢包/限速也会影响下载 ACK。",
-                          S(20), S(502), S(720), S(38), NC_FONT_SMALL, NC_COLOR_TEXT_MUTED,
-                          NC_COLOR_SURFACE, NC_ALIGN_LEFT, true, false);
-    nc_widget_create_button(nc_app_widgets(app), parent, NC_ID_EDITOR_CANCEL, "取消", S(520),
-                            S(548), S(100), S(30), NC_COLOR_CARD, NC_COLOR_TEXT_BUTTON,
-                            NC_FONT_BODY, NC_COLOR_GRAY, true, NC_COLOR_BORDER, false);
-    nc_widget_create_button(nc_app_widgets(app), parent, NC_ID_EDITOR_OK, "确定", S(630), S(548),
-                            S(110), S(30), NC_COLOR_ACCENT, 0x00FFFFFF, NC_FONT_BODY_BOLD,
-                            NC_COLOR_GRAY, false, 0, false);
-    if (allow_delete) {
-        nc_widget_create_button(nc_app_widgets(app), parent, NC_ID_EDITOR_DELETE, "删除配置", S(20),
-                                S(548), S(110), S(30), NC_COLOR_DANGER_BG, NC_COLOR_DANGER_TEXT,
-                                NC_FONT_BODY, NC_COLOR_GRAY, true, NC_COLOR_DANGER_BORDER, false);
-    }
-#undef S
-    nc_widget_apply_fonts(nc_app_widgets(app), &editor->fonts);
-    load_values(editor, existing);
-    return editor;
-}
-
-HWND nc_profile_editor_hwnd(const NcProfileEditor *editor) {
-    return editor ? editor->hwnd : NULL;
-}
-
-const NcFonts *nc_profile_editor_fonts(const NcProfileEditor *editor) {
-    return editor ? &editor->fonts : NULL;
-}
-
-bool nc_profile_editor_closed(const NcProfileEditor *editor) {
-    return editor ? editor->closed : true;
-}
-
-bool nc_profile_editor_take_outcome(NcProfileEditor *editor, NcEditorOutcome *out) {
-    if (!editor || !out || editor->outcome.kind == NC_EDITOR_OUTCOME_NONE) {
-        return false;
-    }
-    *out = editor->outcome;
-    memset(&editor->outcome, 0, sizeof(editor->outcome));
-    return true;
-}
-
-void nc_profile_editor_free(NcProfileEditor *editor) {
-    if (!editor) {
-        return;
-    }
-    nc_config_free_profile(&editor->outcome.profile);
-    nc_fonts_destroy(&editor->fonts);
-    free(editor->existing_id);
-    nc_string_list_free(&editor->existing_names);
-    free(editor);
-}
-
-static void close_editor(NcProfileEditor *editor, NcApp *app) {
-    editor->closed = true;
-    nc_app_cleanup_dialog_widgets(app, editor->hwnd);
-    nc_destroy(editor->hwnd);
-}
-
-static NcNumberInput *number_by_id(NcProfileEditor *editor, int id) {
+static NcNumberInput *number_by_id(ProfileEditor *editor, int id) {
     if (id >= NC_ID_EDITOR_UP_BASE && id < NC_ID_EDITOR_UP_BASE + 6) {
         return &editor->up[id - NC_ID_EDITOR_UP_BASE];
     }
@@ -275,49 +110,43 @@ static void read_direction(const NcNumberInput *numbers, NcDirectionProfile *out
     out->burst_drop_ms = nc_number_value(&numbers[5]);
 }
 
-static void confirm_editor(NcProfileEditor *editor, NcApp *app) {
+static void confirm_editor(ProfileEditor *editor) {
     char *raw_name = nc_get_text(editor->name_edit);
     char *name;
     NcProfile profile;
     NcErr error;
     int row;
-    Str lower;
     if (!raw_name) {
         return;
     }
     name = nc_trim(raw_name);
     if (!name[0]) {
-        nc_app_show_message(app, "请输入配置名称。", "配置无效", MB_OK | MB_ICONWARNING);
+        nc_ui_host_message(&editor->host, "请输入配置名称。", "配置无效", MB_OK | MB_ICONWARNING);
         nc_set_focus(editor->name_edit);
         free(raw_name);
         return;
     }
-    str_init(&lower);
-    str_add(&lower, name);
     if (nc_string_list_contains_ci(&editor->existing_names, name)) {
-        nc_app_show_message(app, "已存在同名配置，请换一个名称。", "配置无效",
+        nc_ui_host_message(&editor->host, "已存在同名配置，请换一个名称。", "配置无效",
                            MB_OK | MB_ICONWARNING);
         nc_set_focus(editor->name_edit);
-        str_free(&lower);
         free(raw_name);
         return;
     }
     for (row = 0; row < 6; row++) {
         if (!nc_number_valid(&editor->up[row])) {
-            nc_app_show_message(app, "请输入有效的非负整数，不要输入单位或小数。", "配置无效",
-                                MB_OK | MB_ICONWARNING);
+            nc_ui_host_message(&editor->host, "请输入有效的非负整数，不要输入单位或小数。", "配置无效",
+                               MB_OK | MB_ICONWARNING);
             nc_set_focus(editor->up[row].edit);
-            str_free(&lower);
             free(raw_name);
             return;
         }
     }
     for (row = 0; row < 6; row++) {
         if (!nc_number_valid(&editor->down[row])) {
-            nc_app_show_message(app, "请输入有效的非负整数，不要输入单位或小数。", "配置无效",
-                                MB_OK | MB_ICONWARNING);
+            nc_ui_host_message(&editor->host, "请输入有效的非负整数，不要输入单位或小数。", "配置无效",
+                               MB_OK | MB_ICONWARNING);
             nc_set_focus(editor->down[row].edit);
-            str_free(&lower);
             free(raw_name);
             return;
         }
@@ -339,19 +168,17 @@ static void confirm_editor(NcProfileEditor *editor, NcApp *app) {
         }
     }
     if (!nc_profile_validate(&profile, &error)) {
-        nc_app_show_message(app, error.msg, "配置无效", MB_OK | MB_ICONWARNING);
+        nc_ui_host_message(&editor->host, error.msg, "配置无效", MB_OK | MB_ICONWARNING);
         nc_config_free_profile(&profile);
-        str_free(&lower);
         free(raw_name);
         return;
     }
     if (nc_profile_all_zero(&profile)) {
-        int answer = nc_app_show_message(app,
-                                         "所有参数均为 0，启动后不会产生弱网效果。仍要保存吗？",
-                                         "配置为空", MB_YESNO | MB_ICONQUESTION);
+        int answer = nc_ui_host_message(&editor->host,
+                                        "所有参数均为 0，启动后不会产生弱网效果。仍要保存吗？",
+                                        "配置为空", MB_YESNO | MB_ICONQUESTION);
         if (answer != IDYES) {
             nc_config_free_profile(&profile);
-            str_free(&lower);
             free(raw_name);
             return;
         }
@@ -359,72 +186,54 @@ static void confirm_editor(NcProfileEditor *editor, NcApp *app) {
     nc_config_free_profile(&editor->outcome.profile);
     editor->outcome.kind = NC_EDITOR_OUTCOME_SAVED;
     editor->outcome.profile = profile;
-    str_free(&lower);
     free(raw_name);
-    close_editor(editor, app);
+    nc_destroy(editor->hwnd);
 }
 
-static void delete_editor(NcProfileEditor *editor, NcApp *app) {
-    int answer = nc_app_show_message(app, "确定删除这个配置吗？", "删除配置",
-                                     MB_YESNO | MB_ICONQUESTION);
+static void delete_editor(ProfileEditor *editor) {
+    int answer = nc_ui_host_message(&editor->host, "确定删除这个配置吗？", "删除配置",
+                                    MB_YESNO | MB_ICONQUESTION);
     if (answer != IDYES) {
         return;
     }
     nc_config_free_profile(&editor->outcome.profile);
     editor->outcome.kind = NC_EDITOR_OUTCOME_DELETED;
-    close_editor(editor, app);
+    nc_destroy(editor->hwnd);
 }
 
-bool nc_profile_editor_message(NcProfileEditor *editor, NcApp *app, UINT message, WPARAM wparam,
-                               LPARAM lparam, LRESULT *result) {
+static LRESULT CALLBACK editor_wnd_proc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
+    ProfileEditor *editor;
+    LRESULT result = 0;
+    if (message == WM_NCCREATE) {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lparam;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    editor = (ProfileEditor *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
     if (!editor) {
-        return false;
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+    if (nc_ui_handle_chrome(&editor->widgets, &editor->fonts, editor->host.white_brush, hwnd,
+                            message, wparam, lparam, NC_COLOR_CARD, &result)) {
+        return result;
     }
     switch (message) {
-    case WM_ERASEBKGND:
-        *result = 1;
-        return true;
-    case WM_PAINT:
-        *result = nc_app_paint_surface(app, editor->hwnd);
-        return true;
-    case WM_DRAWITEM:
-        *result = nc_app_draw_item(app, lparam);
-        return true;
-    case WM_CTLCOLORSTATIC:
-    case WM_CTLCOLOREDIT:
-        nc_set_bk_color((HDC)wparam, NC_COLOR_CARD);
-        nc_set_text_color((HDC)wparam, NC_COLOR_TEXT_DARK);
-        *result = (LRESULT)nc_app_white_brush(app);
-        return true;
-    case WM_CTLCOLORBTN: {
-        uint32_t background;
-        uint32_t foreground;
-        HWND control = (HWND)lparam;
-        if (nc_app_button_colors(app, control, &background, &foreground)) {
-            nc_set_dc_brush_color((HDC)wparam, background);
-            nc_set_text_color((HDC)wparam, foreground);
-            *result = (LRESULT)nc_dc_brush();
-            return true;
-        }
-        return false;
-    }
     case WM_COMMAND: {
         int id = (int)LOWORD(wparam);
         UINT code = HIWORD(wparam);
         if (id == NC_ID_EDITOR_OK) {
-            confirm_editor(editor, app);
+            confirm_editor(editor);
         } else if (id == NC_ID_EDITOR_CANCEL) {
-            close_editor(editor, app);
+            nc_destroy(hwnd);
         } else if (id == NC_ID_EDITOR_DELETE && code == BN_CLICKED) {
-            delete_editor(editor, app);
+            delete_editor(editor);
         } else if (code == EN_KILLFOCUS) {
             NcNumberInput *number = number_by_id(editor, id);
             if (number) {
                 nc_number_clamp(number);
             }
         }
-        *result = 0;
-        return true;
+        return 0;
     }
     case WM_NOTIFY:
         if (lparam) {
@@ -438,21 +247,156 @@ bool nc_profile_editor_message(NcProfileEditor *editor, NcApp *app, UINT message
                         nc_number_delta(number, updown->iDelta);
                     }
                 }
-                *result = 1;
-                return true;
+                return 1;
             }
         }
-        *result = 0;
-        return true;
+        return 0;
     case WM_CLOSE:
-        close_editor(editor, app);
-        *result = 0;
-        return true;
-    case WM_DESTROY:
-        editor->closed = true;
-        *result = 0;
-        return true;
+        nc_destroy(hwnd);
+        return 0;
     default:
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+}
+
+static BOOL CALLBACK register_editor_class([[maybe_unused]] PINIT_ONCE once,
+                                           [[maybe_unused]] PVOID param,
+                                           [[maybe_unused]] PVOID *context) {
+    return nc_register_class(L"NCProfileEditor", editor_wnd_proc) ? TRUE : FALSE;
+}
+
+bool nc_profile_editor_run(const NcUiHost *host, const NcProfile *existing, bool allow_delete,
+                           const NcStringList *existing_names, NcEditorOutcome *out) {
+    static INIT_ONCE class_once = INIT_ONCE_STATIC_INIT;
+    static const char *up_labels[6] = {
+        "上行延时 (ms)", "上行延时抖动 (ms)", "上行带宽 (kbps)",
+        "上行随机丢包 (%)", "上行连续丢包-放行 (ms)", "上行连续丢包-丢包 (ms)"};
+    static const char *down_labels[6] = {
+        "下行延时 (ms)", "下行延时抖动 (ms)", "下行带宽 (kbps)",
+        "下行随机丢包 (%)", "下行连续丢包-放行 (ms)", "下行连续丢包-丢包 (ms)"};
+    static const int32_t limits[6] = {60000, 60000, 1000000, 100, 600000, 600000};
+    static const int32_t increments[6] = {10, 10, 10, 1, 10, 10};
+    ProfileEditor *editor;
+    double preferred;
+    double scale;
+    HWND up_group;
+    HWND down_group;
+    HWND parent;
+    int row;
+    int index;
+    bool ok = false;
+    if (!host || !out) {
         return false;
     }
+    memset(out, 0, sizeof(*out));
+    if (!InitOnceExecuteOnce(&class_once, register_editor_class, NULL, NULL)) {
+        return false;
+    }
+    preferred = host->scale > 0 ? host->scale : 1.0;
+    scale = nc_fit_dialog_scale(host->owner, 760, 592, preferred);
+    editor = (ProfileEditor *)calloc(1, sizeof(ProfileEditor));
+    if (!editor) {
+        return false;
+    }
+    editor->host = *host;
+    editor->existing_id = nc_strdup(existing && existing->id ? existing->id : "");
+    nc_string_list_init(&editor->existing_names);
+    for (index = 0; existing_names && (size_t)index < existing_names->count; index++) {
+        nc_string_list_push(&editor->existing_names, existing_names->items[index]);
+    }
+    nc_widgets_init(&editor->widgets);
+    nc_fonts_init(&editor->fonts, (UINT)(scale * 96.0 + 0.5));
+    editor->hwnd = nc_create_window(L"NCProfileEditor", existing ? L"编辑配置" : L"新建配置",
+                                    NC_STYLE_DIALOG, WS_EX_CONTROLPARENT, host->owner, 0, editor);
+    if (!editor->hwnd) {
+        goto cleanup;
+    }
+    nc_set_window_client_size(editor->hwnd, scale_of(760, scale), scale_of(592, scale));
+    nc_center_on_owner(editor->hwnd, host->owner);
+    parent = editor->hwnd;
+#define S(v) scale_of((v), scale)
+    nc_widget_create_panel(&editor->widgets, parent, NC_ID_EDITOR_HEADER, 0, 0, S(760), S(58),
+                           NC_COLOR_ACCENT, false, 0);
+    nc_widget_create_text(&editor->widgets, parent, NC_ID_EDITOR_TITLE,
+                          existing ? "编辑配置" : "新建配置", S(20), S(14), S(400), S(30),
+                          NC_FONT_TITLE, 0x00FFFFFF, NC_COLOR_ACCENT, NC_ALIGN_LEFT, false, false);
+    nc_widget_create_text(&editor->widgets, parent, NC_ID_EDITOR_NAME_LABEL, "名称", S(20), S(80),
+                          S(44), S(20), NC_FONT_BODY, NC_COLOR_TEXT_DARK, NC_COLOR_SURFACE,
+                          NC_ALIGN_LEFT, false, false);
+    editor->name_edit = nc_widget_create_edit(parent, NC_ID_EDITOR_NAME_EDIT, "", S(70), S(76),
+                                              S(670), S(27), false, NC_ALIGN_LEFT, NULL);
+    SendMessageW(editor->name_edit, NC_EM_SETLIMITTEXT, 60, 0);
+    up_group = nc_widget_create_group(parent, NC_ID_EDITOR_UP_GROUP, "上行", S(20), S(112), S(350),
+                                      S(340));
+    down_group = nc_widget_create_group(parent, NC_ID_EDITOR_DOWN_GROUP, "下行", S(390), S(112),
+                                        S(350), S(340));
+    nc_set_font(up_group, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
+    nc_set_font(down_group, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
+    for (row = 0; row < 6; row++) {
+        int y = 112 + 28 + row * 42;
+        nc_widget_create_text(&editor->widgets, parent,
+                              NC_ID_EDITOR_ROW_LABEL_BASE + row, up_labels[row], S(20 + 14),
+                              S(y + 4), S(150), S(20), NC_FONT_BODY, NC_COLOR_TEXT_BUTTON,
+                              NC_COLOR_SURFACE, NC_ALIGN_LEFT, false, false);
+        nc_number_create(&editor->up[row], parent, NC_ID_EDITOR_UP_BASE + row, S(20 + 170), S(y),
+                         S(165), S(24), limits[row], increments[row]);
+        nc_set_font(editor->up[row].edit, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
+        nc_widget_create_text(&editor->widgets, parent,
+                              NC_ID_EDITOR_ROW_LABEL_BASE + 10 + row, down_labels[row],
+                              S(390 + 14), S(y + 4), S(150), S(20), NC_FONT_BODY,
+                              NC_COLOR_TEXT_BUTTON, NC_COLOR_SURFACE, NC_ALIGN_LEFT, false, false);
+        nc_number_create(&editor->down[row], parent, NC_ID_EDITOR_DOWN_BASE + row, S(390 + 170),
+                         S(y), S(165), S(24), limits[row], increments[row]);
+        nc_set_font(editor->down[row].edit, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
+    }
+    nc_widget_create_text(&editor->widgets, parent, NC_ID_EDITOR_PROTOCOL_LABEL, "弱网控制协议",
+                          S(20), S(470), S(110), S(20), NC_FONT_BODY, NC_COLOR_TEXT_DARK,
+                          NC_COLOR_SURFACE, NC_ALIGN_LEFT, false, false);
+    editor->protocol_combo = nc_widget_create_combo(parent, NC_ID_EDITOR_PROTOCOL_COMBO, S(130),
+                                                    S(466), S(170), S(200));
+    {
+        static const char *items[3] = {"TCP (1)", "UDP (2)", "ALL (3)"};
+        for (index = 0; index < 3; index++) {
+            wchar_t *wide = nc_wide_dup(items[index]);
+            if (wide) {
+                SendMessageW(editor->protocol_combo, CB_ADDSTRING, 0, (LPARAM)wide);
+                free(wide);
+            }
+        }
+    }
+    SendMessageW(editor->protocol_combo, CB_SETCURSEL, 2, 0);
+    nc_set_font(editor->protocol_combo, nc_fonts_get(&editor->fonts, NC_FONT_BODY));
+    nc_widget_create_text(&editor->widgets, parent, NC_ID_EDITOR_HINT,
+                          "带宽单位 kbps；随机丢包单位 %；延时 / 连续丢包单位 ms；0 表示不启用。\r\n"
+                          "连续丢包：放行 X ms、丢包 Y ms 循环；只填“丢包”表示一直丢包。上行丢包/限速也会影响下载 ACK。",
+                          S(20), S(502), S(720), S(38), NC_FONT_SMALL, NC_COLOR_TEXT_MUTED,
+                          NC_COLOR_SURFACE, NC_ALIGN_LEFT, true, false);
+    nc_widget_create_button(&editor->widgets, parent, NC_ID_EDITOR_CANCEL, "取消", S(520),
+                            S(548), S(100), S(30), NC_COLOR_CARD, NC_COLOR_TEXT_BUTTON,
+                            NC_FONT_BODY, NC_COLOR_GRAY, true, NC_COLOR_BORDER, false);
+    nc_widget_create_button(&editor->widgets, parent, NC_ID_EDITOR_OK, "确定", S(630), S(548),
+                            S(110), S(30), NC_COLOR_ACCENT, 0x00FFFFFF, NC_FONT_BODY_BOLD,
+                            NC_COLOR_GRAY, false, 0, false);
+    if (allow_delete) {
+        nc_widget_create_button(&editor->widgets, parent, NC_ID_EDITOR_DELETE, "删除配置", S(20),
+                                S(548), S(110), S(30), NC_COLOR_DANGER_BG, NC_COLOR_DANGER_TEXT,
+                                NC_FONT_BODY, NC_COLOR_GRAY, true, NC_COLOR_DANGER_BORDER, false);
+    }
+#undef S
+    nc_widget_apply_fonts(&editor->widgets, &editor->fonts);
+    load_values(editor, existing);
+    nc_run_modal(host->owner, editor->hwnd);
+    if (editor->outcome.kind != NC_EDITOR_OUTCOME_NONE) {
+        *out = editor->outcome;
+        memset(&editor->outcome, 0, sizeof(editor->outcome));
+        ok = true;
+    }
+cleanup:
+    nc_config_free_profile(&editor->outcome.profile);
+    nc_widgets_free(&editor->widgets);
+    nc_fonts_destroy(&editor->fonts);
+    free(editor->existing_id);
+    nc_string_list_free(&editor->existing_names);
+    free(editor);
+    return ok;
 }

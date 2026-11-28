@@ -1,6 +1,6 @@
 #include "test_harness.h"
 
-#include "../src/engine/flow.h"
+#include "engine/flow.h"
 
 #include <string.h>
 

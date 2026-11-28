@@ -1,12 +1,13 @@
-#include "config.h"
+#include "config/config.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 
-#include "neturl.h"
-#include "version.h"
+#include "core/neturl.h"
+#include "core/time.h"
+#include "core/version.h"
 
 static char *dup_or_empty(const char *text) {
     return nc_strdup(text ? text : "");
@@ -371,6 +372,91 @@ bool nc_profile_validate(const NcProfile *profile, NcErr *err) {
     }
     ok = nc_direction_validate(&profile->downlink, "下行", err);
     return ok;
+}
+
+void nc_normalize_process_name(const char *raw, Str *out) {
+    const char *start;
+    const char *end;
+    const char *file;
+    const char *p;
+    size_t len;
+    char *piece;
+    wchar_t *wide;
+    wchar_t *lower;
+    char *utf8;
+    if (!out) {
+        return;
+    }
+    str_clear(out);
+    if (!raw) {
+        return;
+    }
+    start = raw;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    file = start;
+    for (p = start; p < end; p++) {
+        if (*p == '\\' || *p == '/') {
+            file = p + 1;
+        }
+    }
+    len = (size_t)(end - file);
+    if (len >= 4 && _strnicmp(file + len - 4, ".exe", 4) == 0) {
+        len -= 4;
+    }
+    while (len > 0 && isspace((unsigned char)file[0])) {
+        file++;
+        len--;
+    }
+    while (len > 0 && isspace((unsigned char)file[len - 1])) {
+        len--;
+    }
+    if (len == 0) {
+        return;
+    }
+    piece = (char *)malloc(len + 1);
+    if (!piece) {
+        return;
+    }
+    memcpy(piece, file, len);
+    piece[len] = 0;
+    wide = nc_wide_dup(piece);
+    free(piece);
+    if (!wide) {
+        return;
+    }
+    lower = NULL;
+    if (!nc_lower_wide(wide, &lower)) {
+        lower = wide;
+        wide = NULL;
+    }
+    free(wide);
+    utf8 = nc_utf8_dup(lower);
+    free(lower);
+    if (utf8) {
+        str_add(out, utf8);
+        free(utf8);
+    }
+}
+
+void nc_normalize_display_name(const char *raw, Str *out) {
+    Str name;
+    if (!out) {
+        return;
+    }
+    str_clear(out);
+    str_init(&name);
+    nc_normalize_process_name(raw, &name);
+    if (name.len > 0) {
+        str_add(out, str_cstr(&name));
+        str_add(out, ".exe");
+    }
+    str_free(&name);
 }
 
 void nc_config_normalize_process_name(const char *raw, Str *out) {

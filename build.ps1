@@ -1,13 +1,13 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
-    NetConditioner 一键构建：LLVM 工具链 + 单元测试 + 生成单文件 exe 与云更新清单。
+    NetConditioner 一键构建：LLVM 工具链 + 增量编译 + 分层单元测试 + 单文件 exe 与云更新清单。
 
 .DESCRIPTION
     默认按顺序执行：
-      1. 用 clang-cl.exe 编译 C23 源码，lld-link.exe 链接，llvm-rc.exe 编译资源；
-         可用 -Toolchain MSVC 切回 cl.exe/link.exe/rc.exe
-      2. 运行单元测试（tests 下的控制台测试程序，无需管理员、不联网）
+      1. 用 clang-cl.exe 增量编译 C23 源码（含 .d 头文件依赖追踪），lld-link.exe 链接，llvm-rc.exe 编译资源；
+         可用 -Toolchain MSVC 切回 cl.exe/link.exe/rc.exe；同时输出 build\compile_commands.json
+      2. 仅链接 core/config/engine/update 分层库，运行离线单元测试（无需管理员、不联网）
       3. 把 build\NetConditioner.exe 复制为 dist\NetConditioner-<版本>-win-x64.exe，
          并生成 dist\latest.json
 
@@ -72,9 +72,75 @@ function Get-CanonicalVersion {
     return $Value
 }
 
-function Write-Utf8File {
+function Write-Utf8FileIfChanged {
     param([string]$Path, [string]$Text)
+    if (Test-Path -LiteralPath $Path) {
+        $existing = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+        if ($existing -ceq $Text) {
+            return $false
+        }
+    }
     [System.IO.File]::WriteAllText($Path, $Text, (New-Object System.Text.UTF8Encoding($false)))
+    return $true
+}
+
+function Get-ObjectBaseName {
+    param([string]$FilePath)
+    $rootWithSep = $repoRoot.TrimEnd("\") + "\"
+    if (-not $FilePath.StartsWith($rootWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "源文件路径异常：$FilePath"
+    }
+    $rel = $FilePath.Substring($rootWithSep.Length)
+    $noExt = $rel -replace '\.[^.\\/]+$', ''
+    return ($noExt -replace '[\\/:\s]+', '__')
+}
+
+function Test-DepfileUpToDate {
+    param(
+        [string]$SourceFile,
+        [string]$ObjectFile,
+        [string]$DepFile,
+        [bool]$ForceRebuild
+    )
+    if ($ForceRebuild -or -not (Test-Path -LiteralPath $ObjectFile) -or -not (Test-Path -LiteralPath $DepFile)) {
+        return $false
+    }
+    $objTime = (Get-Item -LiteralPath $ObjectFile).LastWriteTimeUtc
+    if ((Get-Item -LiteralPath $SourceFile).LastWriteTimeUtc -gt $objTime) {
+        return $false
+    }
+    $raw = [System.IO.File]::ReadAllText($DepFile)
+    $unfolded = $raw -replace '\\\r?\n', ' '
+    $colonIndex = $unfolded.IndexOf(": ")
+    if ($colonIndex -lt 0) { return $false }
+    $depsPart = $unfolded.Substring($colonIndex + 2)
+    # Parse space-separated paths (handling escaped spaces "\ ")
+    $tokens = New-Object System.Collections.Generic.List[string]
+    $sb = New-Object System.Text.StringBuilder
+    for ($i = 0; $i -lt $depsPart.Length; $i++) {
+        $ch = $depsPart[$i]
+        if ($ch -eq '\' -and $i + 1 -lt $depsPart.Length -and $depsPart[$i + 1] -eq ' ') {
+            [void]$sb.Append(' ')
+            $i++
+        } elseif ([char]::IsWhiteSpace($ch)) {
+            if ($sb.Length -gt 0) {
+                $tokens.Add($sb.ToString()) | Out-Null
+                $sb.Clear() | Out-Null
+            }
+        } else {
+            [void]$sb.Append($ch)
+        }
+    }
+    if ($sb.Length -gt 0) {
+        $tokens.Add($sb.ToString()) | Out-Null
+    }
+    foreach ($dep in $tokens) {
+        if (-not (Test-Path -LiteralPath $dep)) { return $false }
+        if ((Get-Item -LiteralPath $dep).LastWriteTimeUtc -gt $objTime) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Assert-X64Executable {
@@ -158,36 +224,42 @@ function ConvertTo-ProcessArgument {
     return $Value
 }
 
-# clang-cl does not implement /MP. Compile translation units as separate
-# processes and keep up to min(CPU count, 12) of them running at once.
 function Invoke-ClangCompile {
     param(
         [string[]]$Files,
         [string]$TargetDir,
         [string[]]$Flags,
-        [string]$Compiler
+        [string]$Compiler,
+        [bool]$ForceRebuild
     )
     if (-not (Test-Path -LiteralPath $TargetDir)) {
         New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
     }
     $objects = New-Object System.Collections.Generic.List[string]
+    $toCompile = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $Files) {
+        $base = Get-ObjectBaseName -FilePath $file
+        $object = Join-Path $TargetDir ($base + '.obj')
+        $dep = Join-Path $TargetDir ($base + '.d')
+        $objects.Add($object) | Out-Null
+        if (-not (Test-DepfileUpToDate -SourceFile $file -ObjectFile $object -DepFile $dep -ForceRebuild $ForceRebuild)) {
+            $toCompile.Add([pscustomobject]@{ File = $file; Base = $base; Object = $object; Dep = $dep }) | Out-Null
+        }
+    }
+    if ($toCompile.Count -eq 0) {
+        return $objects.ToArray()
+    }
     $jobs = New-Object System.Collections.Generic.List[object]
     $failures = New-Object System.Collections.Generic.List[string]
     $limit = [Environment]::ProcessorCount
     if ($limit -lt 1) { $limit = 1 }
     if ($limit -gt 12) { $limit = 12 }
     $index = 0
-    while ($index -lt $Files.Count -or $jobs.Count -gt 0) {
-        while ($jobs.Count -lt $limit -and $index -lt $Files.Count) {
-            $file = $Files[$index]
+    while ($index -lt $toCompile.Count -or $jobs.Count -gt 0) {
+        while ($jobs.Count -lt $limit -and $index -lt $toCompile.Count) {
+            $item = $toCompile[$index]
             $index++
-            if ($file.Length -le $repoRoot.Length) {
-                throw "源文件路径异常：$file"
-            }
-            $name = [System.IO.Path]::GetFileNameWithoutExtension($file)
-            $object = Join-Path $TargetDir ($name + '.obj')
-            $objects.Add($object) | Out-Null
-            $arguments = @($Flags) + @("/Fo$object", $file)
+            $arguments = @($Flags) + @("/clang:-MMD", "/clang:-MF$($item.Dep)", "/Fo$($item.Object)", $item.File)
             $argumentLine = ($arguments | ForEach-Object { ConvertTo-ProcessArgument $_ }) -join ' '
             $startInfo = New-Object System.Diagnostics.ProcessStartInfo
             $startInfo.FileName = $Compiler
@@ -204,15 +276,13 @@ function Invoke-ClangCompile {
             $stdoutTask = $process.StandardOutput.ReadToEndAsync()
             $stderrTask = $process.StandardError.ReadToEndAsync()
             $jobs.Add([pscustomobject]@{
-                Name = $name
+                Name = $item.Base
                 Process = $process
                 Stdout = $stdoutTask
                 Stderr = $stderrTask
             }) | Out-Null
         }
-        if ($jobs.Count -eq 0) {
-            break
-        }
+        if ($jobs.Count -eq 0) { break }
         $finished = @($jobs | Where-Object { $_.Process.HasExited })
         if ($finished.Count -eq 0) {
             Start-Sleep -Milliseconds 15
@@ -223,15 +293,9 @@ function Invoke-ClangCompile {
             $exitCode = $job.Process.ExitCode
             $stdoutText = $job.Stdout.GetAwaiter().GetResult()
             $stderrText = $job.Stderr.GetAwaiter().GetResult()
-            if ($stdoutText -and $stdoutText.Trim().Length -gt 0) {
-                Write-Host $stdoutText.TrimEnd()
-            }
-            if ($stderrText -and $stderrText.Trim().Length -gt 0) {
-                Write-Host $stderrText.TrimEnd()
-            }
-            if ($exitCode -ne 0) {
-                $failures.Add($job.Name) | Out-Null
-            }
+            if ($stdoutText -and $stdoutText.Trim().Length -gt 0) { Write-Host $stdoutText.TrimEnd() }
+            if ($stderrText -and $stderrText.Trim().Length -gt 0) { Write-Host $stderrText.TrimEnd() }
+            if ($exitCode -ne 0) { $failures.Add($job.Name) | Out-Null }
             $job.Process.Dispose()
             [void]$jobs.Remove($job)
         }
@@ -246,30 +310,61 @@ function Invoke-ClCompile {
     param(
         [string[]]$Files,
         [string]$TargetDir,
-        [string[]]$Flags
+        [string[]]$Flags,
+        [bool]$ForceRebuild,
+        [datetime]$LatestHeaderUtc
     )
     if (-not (Test-Path -LiteralPath $TargetDir)) {
         New-Item -ItemType Directory -Force -Path $TargetDir | Out-Null
     }
     $objects = New-Object System.Collections.Generic.List[string]
+    $toCompile = New-Object System.Collections.Generic.List[object]
     foreach ($file in $Files) {
-        if ($file.Length -le $repoRoot.Length) {
-            throw "源文件路径异常：$file"
-        }
-        $name = [System.IO.Path]::GetFileNameWithoutExtension($file)
-        $object = Join-Path $TargetDir ($name + '.obj')
+        $base = Get-ObjectBaseName -FilePath $file
+        $object = Join-Path $TargetDir ($base + '.obj')
         $objects.Add($object) | Out-Null
+        $upToDate = $false
+        if (-not $ForceRebuild -and (Test-Path -LiteralPath $object)) {
+            $objTime = (Get-Item -LiteralPath $object).LastWriteTimeUtc
+            $srcTime = (Get-Item -LiteralPath $file).LastWriteTimeUtc
+            if ($objTime -ge $srcTime -and $objTime -ge $LatestHeaderUtc) {
+                $upToDate = $true
+            }
+        }
+        if (-not $upToDate) {
+            $toCompile.Add([pscustomobject]@{ File = $file; Object = $object }) | Out-Null
+        }
     }
-    # One cl invocation with /MP: the compiler schedules translation units across
-    # cores and /Fo<dir> keeps every object in the same output directory.
-    $compileOutput = & cl.exe @Flags "/Fo$TargetDir\" @Files 2>&1
-    if ($compileOutput) {
-        $compileOutput | ForEach-Object { Write-Host $_ }
-    }
-    if ($LASTEXITCODE -ne 0) {
-        throw "编译失败（退出码 $LASTEXITCODE）"
+    foreach ($item in $toCompile) {
+        $compileOutput = & cl.exe @Flags "/Fo$($item.Object)" $item.File 2>&1
+        if ($compileOutput) {
+            $compileOutput | ForEach-Object { Write-Host $_ }
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "编译失败（退出码 $LASTEXITCODE）：$($item.File)"
+        }
     }
     return $objects.ToArray()
+}
+
+function Write-CompileCommands {
+    param(
+        [string]$Path,
+        [string]$Compiler,
+        [string[]]$Flags,
+        [string[]]$Files
+    )
+    $entries = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $Files) {
+        $args = @($Compiler) + $Flags + @($file)
+        $entries.Add([ordered]@{
+            directory = $repoRoot
+            file      = $file
+            arguments = $args
+        }) | Out-Null
+    }
+    $json = ($entries | ConvertTo-Json -Depth 4) + [Environment]::NewLine
+    [void](Write-Utf8FileIfChanged -Path $Path -Text $json)
 }
 
 function Invoke-Link {
@@ -278,14 +373,10 @@ function Invoke-Link {
         [string]$Resource,
         [string]$Output,
         [string]$Subsystem,
-        [string[]]$ExtraFlags
+        [string[]]$ExtraFlags,
+        [string[]]$Libraries
     )
-    $libraries = @(
-        'kernel32.lib', 'user32.lib', 'gdi32.lib', 'comctl32.lib', 'shell32.lib',
-        'ole32.lib', 'advapi32.lib', 'bcrypt.lib', 'winhttp.lib', 'ws2_32.lib',
-        'iphlpapi.lib', 'shlwapi.lib', 'uuid.lib'
-    )
-    $arguments = @('/NOLOGO', "/SUBSYSTEM:$Subsystem", "/OUT:$Output", '/OPT:REF', '/OPT:ICF', '/STACK:8388608')
+    $arguments = @('/NOLOGO', "/SUBSYSTEM:$Subsystem", "/OUT:$Output", '/OPT:REF', '/OPT:ICF')
     if ($Toolchain -eq 'MSVC') {
         $arguments += '/MANIFEST:NO'
     }
@@ -296,7 +387,7 @@ function Invoke-Link {
     if ($Resource) {
         $arguments += $Resource
     }
-    $arguments += $libraries
+    $arguments += $Libraries
     & $linker @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "链接失败（退出码 $LASTEXITCODE）：$Output"
@@ -304,18 +395,12 @@ function Invoke-Link {
 }
 
 Write-Host '========================================' -ForegroundColor Cyan
-Write-Host ' NetConditioner 构建（C / LLVM，单文件版）' -ForegroundColor Cyan
+Write-Host ' NetConditioner 构建（C23 分层单文件版）' -ForegroundColor Cyan
 Write-Host '========================================' -ForegroundColor Cyan
 
-if (-not (Test-Path -LiteralPath $versionFile)) {
-    throw "未找到版本文件：$versionFile"
-}
-if (-not (Test-Path -LiteralPath $appManifest)) {
-    throw "未找到应用程序清单：$appManifest"
-}
-if (-not (Test-Path -LiteralPath $srcDir)) {
-    throw "未找到源码目录：$srcDir"
-}
+if (-not (Test-Path -LiteralPath $versionFile)) { throw "未找到版本文件：$versionFile" }
+if (-not (Test-Path -LiteralPath $appManifest)) { throw "未找到应用程序清单：$appManifest" }
+if (-not (Test-Path -LiteralPath $srcDir)) { throw "未找到源码目录：$srcDir" }
 
 $rawVersion = [System.IO.File]::ReadAllText($versionFile).Trim()
 $canonicalVersion = Get-CanonicalVersion -Value $rawVersion
@@ -345,15 +430,9 @@ if ($Toolchain -eq 'LLVM') {
     $clangCommand = Get-Command clang-cl.exe -ErrorAction SilentlyContinue
     $lldCommand = Get-Command lld-link.exe -ErrorAction SilentlyContinue
     $llvmRcCommand = Get-Command llvm-rc.exe -ErrorAction SilentlyContinue
-    if (-not $clangCommand) {
-        throw '未找到 clang-cl.exe。请安装 LLVM/Clang 并把其 bin 目录加入 PATH，或使用 -Toolchain MSVC。'
-    }
-    if (-not $lldCommand) {
-        throw '未找到 lld-link.exe。请安装完整的 LLVM/Clang 工具链，或使用 -Toolchain MSVC。'
-    }
-    if (-not $llvmRcCommand) {
-        throw '未找到 llvm-rc.exe。请安装完整的 LLVM/Clang 工具链，或使用 -Toolchain MSVC。'
-    }
+    if (-not $clangCommand) { throw '未找到 clang-cl.exe。请安装 LLVM/Clang 并把其 bin 目录加入 PATH，或使用 -Toolchain MSVC。' }
+    if (-not $lldCommand) { throw '未找到 lld-link.exe。请安装完整的 LLVM/Clang 工具链，或使用 -Toolchain MSVC。' }
+    if (-not $llvmRcCommand) { throw '未找到 llvm-rc.exe。请安装完整的 LLVM/Clang 工具链，或使用 -Toolchain MSVC。' }
     $compiler = $clangCommand.Source
     $linker = $lldCommand.Source
     $resourceCompiler = $llvmRcCommand.Source
@@ -363,15 +442,9 @@ if ($Toolchain -eq 'LLVM') {
     $clCommand = Get-Command cl.exe -ErrorAction SilentlyContinue
     $linkCommand = Get-Command link.exe -ErrorAction SilentlyContinue
     $rcCommand = Get-Command rc.exe -ErrorAction SilentlyContinue
-    if (-not $clCommand) {
-        throw '未找到 cl.exe。请安装 Visual Studio 2022 Build Tools 的“使用 C++ 的桌面开发”工作负载。'
-    }
-    if (-not $linkCommand) {
-        throw '未找到 link.exe。请安装 Visual Studio 2022 Build Tools 的 C++ 工具集。'
-    }
-    if (-not $rcCommand) {
-        throw '未找到 rc.exe。请安装 Windows SDK。'
-    }
+    if (-not $clCommand) { throw '未找到 cl.exe。请安装 Visual Studio 2022 Build Tools 的“使用 C++ 的桌面开发”工作负载。' }
+    if (-not $linkCommand) { throw '未找到 link.exe。请安装 Visual Studio 2022 Build Tools 的 C++ 工具集。' }
+    if (-not $rcCommand) { throw '未找到 rc.exe。请安装 Windows SDK。' }
     $compiler = $clCommand.Source
     $linker = $linkCommand.Source
     $resourceCompiler = $rcCommand.Source
@@ -406,7 +479,7 @@ foreach ($directory in @($objDir, $testObjDir, $testBinDir, $genDir)) {
 }
 
 # ---------------------------------------------------------------------------
-# 生成版本头与资源脚本
+# 生成版本头与资源脚本（内容未变时不改时间戳，支持增量编译）
 # ---------------------------------------------------------------------------
 
 $newline = [Environment]::NewLine
@@ -423,7 +496,7 @@ $versionHeader = @"
 #define NC_WINDIVERT_VERSION "$winDivertVersion"
 #define NC_WINDIVERT_VERSION_WSTR L"$winDivertVersion"
 "@
-Write-Utf8File -Path (Join-Path $genDir 'nc_version.h') -Text ($versionHeader + $newline)
+[void](Write-Utf8FileIfChanged -Path (Join-Path $genDir 'nc_version.h') -Text ($versionHeader + $newline))
 
 function ConvertTo-RcPath {
     param([string]$Path)
@@ -472,7 +545,7 @@ WINDIVERT_LICENSE RCDATA "$licenseRc"
 WINDIVERT_VERSION RCDATA "$payloadVersionRc"
 "@
 $resourcePath = Join-Path $genDir 'netconditioner.rc'
-Write-Utf8File -Path $resourcePath -Text ($resourceScript + $newline)
+$rcChanged = Write-Utf8FileIfChanged -Path $resourcePath -Text ($resourceScript + $newline)
 
 # ---------------------------------------------------------------------------
 # 编译与链接
@@ -485,9 +558,6 @@ $defines = @(
 $stdFlag = if ($Toolchain -eq 'LLVM') { '/clang:-std=c23' } else { '/std:clatest' }
 $commonFlags = @('/nologo', '/c', $stdFlag, '/W4', '/wd5105', '/MT', '/utf-8', '/Zp8') + $defines +
     @('/I', $srcDir, '/I', $genDir)
-if ($Toolchain -eq 'MSVC') {
-    $commonFlags += '/MP'
-}
 $linkFlags = @()
 if ($Configuration -eq 'Release') {
     $commonFlags += '/O2'
@@ -503,37 +573,90 @@ if ($Configuration -eq 'Release') {
     $linkFlags += @('/DEBUG', "/PDB:$buildDir\NetConditioner.pdb")
 }
 
+$flagSignature = "$Toolchain|$Configuration|$compiler|" + ($commonFlags -join " ")
+$sigFile = Join-Path $objDir 'build_flags.txt'
+$forceRebuild = $Clean.IsPresent -or (Write-Utf8FileIfChanged -Path $sigFile -Text $flagSignature)
+
 $sourceFiles = @(Get-ChildItem -LiteralPath $srcDir -Recurse -Filter *.c -File |
     Sort-Object FullName | ForEach-Object { $_.FullName })
 if ($sourceFiles.Count -eq 0) {
     throw "源码目录中没有 .c 文件：$srcDir"
 }
+$testSources = @()
+if (Test-Path -LiteralPath $testsDir) {
+    $testSources = @(Get-ChildItem -LiteralPath $testsDir -Filter *.c -File |
+        Sort-Object FullName | ForEach-Object { $_.FullName })
+}
+
+# 生成 compile_commands.json 以便 clangd / IDE 开箱即用。
+Write-CompileCommands -Path (Join-Path $buildDir 'compile_commands.json') -Compiler $compiler -Flags $commonFlags -Files ($sourceFiles + $testSources)
+
+# 分层划分：core / config / engine / update 为核心库（可独立供单元测试链接）；ui / app / main 为桌面应用层。
+$uiPrefix = (Join-Path $srcDir 'ui') + '\'
+$appPrefix = (Join-Path $srcDir 'app') + '\'
 $mainSource = Join-Path $srcDir 'main.c'
-$librarySources = @($sourceFiles | Where-Object { $_ -ne $mainSource })
+$coreLibSources = @($sourceFiles | Where-Object {
+    $_ -ne $mainSource -and
+    -not $_.StartsWith($uiPrefix, [System.StringComparison]::OrdinalIgnoreCase) -and
+    -not $_.StartsWith($appPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+})
+$appLayerSources = @($sourceFiles | Where-Object {
+    $_ -eq $mainSource -or
+    $_.StartsWith($uiPrefix, [System.StringComparison]::OrdinalIgnoreCase) -or
+    $_.StartsWith($appPrefix, [System.StringComparison]::OrdinalIgnoreCase)
+})
+
+$latestHeaderUtc = [datetime]::MinValue
+if ($Toolchain -eq 'MSVC') {
+    $allHeaders = @(Get-ChildItem -LiteralPath $srcDir,$genDir -Recurse -Filter *.h -File -ErrorAction SilentlyContinue)
+    foreach ($h in $allHeaders) {
+        if ($h.LastWriteTimeUtc -gt $latestHeaderUtc) { $latestHeaderUtc = $h.LastWriteTimeUtc }
+    }
+}
 
 Write-Host '[1/4] 编译应用程序...' -ForegroundColor Cyan
 if ($Toolchain -eq 'LLVM') {
-    $mainObject = @(Invoke-ClangCompile -Files @($mainSource) -TargetDir $objDir -Flags $commonFlags -Compiler $compiler)[0]
-    $libraryObjects = @(Invoke-ClangCompile -Files $librarySources -TargetDir $objDir -Flags $commonFlags -Compiler $compiler)
+    $coreObjects = @(Invoke-ClangCompile -Files $coreLibSources -TargetDir $objDir -Flags $commonFlags -Compiler $compiler -ForceRebuild $forceRebuild)
+    $appObjects = @(Invoke-ClangCompile -Files $appLayerSources -TargetDir $objDir -Flags $commonFlags -Compiler $compiler -ForceRebuild $forceRebuild)
 } else {
-    $mainObject = @(Invoke-ClCompile -Files @($mainSource) -TargetDir $objDir -Flags $commonFlags)[0]
-    $libraryObjects = @(Invoke-ClCompile -Files $librarySources -TargetDir $objDir -Flags $commonFlags)
+    $coreObjects = @(Invoke-ClCompile -Files $coreLibSources -TargetDir $objDir -Flags $commonFlags -ForceRebuild $forceRebuild -LatestHeaderUtc $latestHeaderUtc)
+    $appObjects = @(Invoke-ClCompile -Files $appLayerSources -TargetDir $objDir -Flags $commonFlags -ForceRebuild $forceRebuild -LatestHeaderUtc $latestHeaderUtc)
 }
 
-Write-Host '      编译资源...' -ForegroundColor DarkGray
 $resourceObject = Join-Path $objDir 'netconditioner.res'
-if ($Toolchain -eq 'LLVM') {
-    & $resourceCompiler /FO $resourceObject /I $genDir $resourcePath
-} else {
-    & rc.exe /nologo /i $genDir "/fo$resourceObject" $resourcePath
+$needRc = $forceRebuild -or $rcChanged -or -not (Test-Path -LiteralPath $resourceObject)
+if (-not $needRc) {
+    $resTime = (Get-Item -LiteralPath $resourceObject).LastWriteTimeUtc
+    foreach ($dep in @($appManifest, (Join-Path $winDivertDir 'WinDivert.dll'), (Join-Path $winDivertDir 'WinDivert64.sys'), (Join-Path $winDivertDir 'LICENSE'), (Join-Path $winDivertDir 'VERSION'))) {
+        if ((Get-Item -LiteralPath $dep).LastWriteTimeUtc -gt $resTime) { $needRc = $true; break }
+    }
 }
-if ($LASTEXITCODE -ne 0) { throw "资源编译失败（退出码 $LASTEXITCODE）" }
+if ($needRc) {
+    Write-Host '      编译资源...' -ForegroundColor DarkGray
+    if ($Toolchain -eq 'LLVM') {
+        & $resourceCompiler /FO $resourceObject /I $genDir $resourcePath
+    } else {
+        & rc.exe /nologo /i $genDir "/fo$resourceObject" $resourcePath
+    }
+    if ($LASTEXITCODE -ne 0) { throw "资源编译失败（退出码 $LASTEXITCODE）" }
+}
+
+$appLibraries = @(
+    'kernel32.lib', 'user32.lib', 'gdi32.lib', 'comctl32.lib', 'shell32.lib',
+    'ole32.lib', 'advapi32.lib', 'bcrypt.lib', 'winhttp.lib', 'ws2_32.lib',
+    'iphlpapi.lib', 'shlwapi.lib', 'uuid.lib'
+)
+$coreLibraries = @(
+    'kernel32.lib', 'user32.lib', 'gdi32.lib', 'comctl32.lib', 'shell32.lib',
+    'ole32.lib', 'advapi32.lib', 'bcrypt.lib', 'winhttp.lib', 'ws2_32.lib',
+    'iphlpapi.lib', 'shlwapi.lib', 'uuid.lib'
+)
 
 $executable = Join-Path $buildDir 'NetConditioner.exe'
-Invoke-Link -Objects (@($mainObject) + $libraryObjects) -Resource $resourceObject -Output $executable -Subsystem Windows -ExtraFlags $linkFlags
+Invoke-Link -Objects ($coreObjects + $appObjects) -Resource $resourceObject -Output $executable -Subsystem Windows -ExtraFlags $linkFlags -Libraries $appLibraries
 
 # ---------------------------------------------------------------------------
-# 单元测试
+# 单元测试（仅链接 core/config/engine/update 分层对象，强制核心层不依赖 ui/app）
 # ---------------------------------------------------------------------------
 
 if (-not $SkipTests) {
@@ -542,18 +665,16 @@ if (-not $SkipTests) {
     if (-not (Test-Path -LiteralPath $testsDir)) {
         throw "未找到测试目录：$testsDir"
     }
-    $testSources = @(Get-ChildItem -LiteralPath $testsDir -Filter *.c -File |
-        Sort-Object FullName | ForEach-Object { $_.FullName })
     if ($testSources.Count -eq 0) {
         throw "测试目录中没有 .c 文件：$testsDir"
     }
     if ($Toolchain -eq 'LLVM') {
-        $testObjects = Invoke-ClangCompile -Files $testSources -TargetDir $testObjDir -Flags $commonFlags -Compiler $compiler
+        $testObjects = @(Invoke-ClangCompile -Files $testSources -TargetDir $testObjDir -Flags $commonFlags -Compiler $compiler -ForceRebuild $forceRebuild)
     } else {
-        $testObjects = Invoke-ClCompile -Files $testSources -TargetDir $testObjDir -Flags $commonFlags
+        $testObjects = @(Invoke-ClCompile -Files $testSources -TargetDir $testObjDir -Flags $commonFlags -ForceRebuild $forceRebuild -LatestHeaderUtc $latestHeaderUtc)
     }
     $testExecutable = Join-Path $testBinDir 'NetConditionerTests.exe'
-    Invoke-Link -Objects (@($libraryObjects) + $testObjects) -Resource $null -Output $testExecutable -Subsystem Console -ExtraFlags $linkFlags
+    Invoke-Link -Objects ($coreObjects + $testObjects) -Resource $null -Output $testExecutable -Subsystem Console -ExtraFlags $linkFlags -Libraries $coreLibraries
     & $testExecutable
     if ($LASTEXITCODE -ne 0) {
         throw "单元测试失败（退出码 $LASTEXITCODE）"

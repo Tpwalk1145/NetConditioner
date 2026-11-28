@@ -1,7 +1,7 @@
 #include "test_harness.h"
 
-#include "../src/config.h"
-#include "../src/json.h"
+#include "config/config.h"
+#include "core/json.h"
 
 #include <stdio.h>
 #include <stdlib.h>

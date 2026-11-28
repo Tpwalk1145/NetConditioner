@@ -1,6 +1,6 @@
 #include "test_harness.h"
 
-#include "../src/version.h"
+#include "core/version.h"
 
 #include <string.h>
 

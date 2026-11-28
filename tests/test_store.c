@@ -1,6 +1,8 @@
 #include "test_harness.h"
 
-#include "../src/store.h"
+#include "config/store.h"
+#include "core/fs.h"
+#include "core/time.h"
 
 #include <process.h>
 #include <stdio.h>
@@ -97,15 +99,18 @@ typedef struct {
 static unsigned __stdcall save_thread(void *parameter) {
     SaveContext *context = (SaveContext *)parameter;
     NcStore store;
+    wstr_init(&store.path);
     NcConfig config;
     NcErr error;
-    nc_copy_wide(store.path, sizeof(store.path) / sizeof(store.path[0]), context->path);
+    nc_store_init_path(&store, context->path);
     nc_config_fresh(&config);
     config.settings.max_run_minutes = context->index;
     if (!nc_store_save(&store, &config, &error)) {
+        nc_store_free(&store);
         nc_config_free(&config);
         return 1;
     }
+    nc_store_free(&store);
     nc_config_free(&config);
     return 0;
 }
@@ -119,7 +124,7 @@ void test_store_run(void) {
 
     make_temp_dir(dir, sizeof(dir) / sizeof(dir[0]));
     CHECK(nc_path_join(path, sizeof(path) / sizeof(path[0]), dir, L"config.json"));
-    nc_copy_wide(store.path, sizeof(store.path) / sizeof(store.path[0]), path);
+    wstr_set(&store.path, path);
 
     /* Broken JSON is backed up and replaced with defaults. */
     CHECK(write_text(path, "{ not json"));
@@ -139,7 +144,7 @@ void test_store_run(void) {
         CHECK(nc_path_join(original, sizeof(original) / sizeof(original[0]), path, L"original"));
         CHECK(write_text(original, "keep me"));
     }
-    nc_copy_wide(store.path, sizeof(store.path) / sizeof(store.path[0]), path);
+    wstr_set(&store.path, path);
     CHECK(nc_store_load(&store, &config, warning, sizeof(warning)));
     CHECK(strstr(warning, "保留原文件未覆盖") != NULL);
     {
@@ -161,7 +166,7 @@ void test_store_run(void) {
     /* Save/load round trip and concurrent saves. */
     make_temp_dir(dir, sizeof(dir) / sizeof(dir[0]));
     CHECK(nc_path_join(path, sizeof(path) / sizeof(path[0]), dir, L"config.json"));
-    nc_copy_wide(store.path, sizeof(store.path) / sizeof(store.path[0]), path);
+    wstr_set(&store.path, path);
     {
         NcErr error;
         nc_config_fresh(&config);
@@ -197,7 +202,7 @@ void test_store_run(void) {
     /* Loading an unchanged config does not rewrite unknown fields. */
     make_temp_dir(dir, sizeof(dir) / sizeof(dir[0]));
     CHECK(nc_path_join(path, sizeof(path) / sizeof(path[0]), dir, L"config.json"));
-    nc_copy_wide(store.path, sizeof(store.path) / sizeof(store.path[0]), path);
+    wstr_set(&store.path, path);
     {
         NcErr error;
         JsonValue *root;
@@ -243,7 +248,7 @@ void test_store_run(void) {
     /* Saving preserves unknown nested fields. */
     make_temp_dir(dir, sizeof(dir) / sizeof(dir[0]));
     CHECK(nc_path_join(path, sizeof(path) / sizeof(path[0]), dir, L"config.json"));
-    nc_copy_wide(store.path, sizeof(store.path) / sizeof(store.path[0]), path);
+    wstr_set(&store.path, path);
     CHECK(write_text(path,
                      "{\"version\":1,\"future\":1,\"profiles\":[{\"id\":\"p\",\"name\":\"kept\","
                      "\"futureProfile\":2}],\"settings\":{\"futureSetting\":3}}"));
@@ -268,7 +273,7 @@ void test_store_run(void) {
     /* Unsupported schema and oversize files are not rewritten. */
     make_temp_dir(dir, sizeof(dir) / sizeof(dir[0]));
     CHECK(nc_path_join(path, sizeof(path) / sizeof(path[0]), dir, L"config.json"));
-    nc_copy_wide(store.path, sizeof(store.path) / sizeof(store.path[0]), path);
+    wstr_set(&store.path, path);
     {
         const char *unsupported = "{\"schemaVersion\":99,\"future\":1}";
         CHECK(write_text(path, unsupported));
@@ -300,4 +305,5 @@ void test_store_run(void) {
         free(text);
     }
     remove_tree(dir);
+    nc_store_free(&store);
 }

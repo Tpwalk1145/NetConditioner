@@ -1,6 +1,6 @@
 #include "test_harness.h"
 
-#include "../src/neturl.h"
+#include "core/neturl.h"
 
 #include <string.h>
 

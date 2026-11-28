@@ -1,16 +1,16 @@
-#include "main_window.h"
+#include "ui/main_window.h"
 
 #include <string.h>
 
-#include "ids.h"
-#include "win.h"
+#include "ui/ids.h"
+#include "core/win.h"
 
 static int scale_of(int value, double scale) {
     return (int)((double)value * scale + 0.5);
 }
 
-HWND nc_main_window_create(void) {
-    return nc_create_window(L"NCMain", L"弱网模拟器", NC_STYLE_MAIN, 0, NULL, 0, NULL);
+HWND nc_main_window_create(void *param) {
+    return nc_create_window(L"NCMain", L"弱网模拟器", NC_STYLE_MAIN, 0, NULL, 0, param);
 }
 
 void nc_main_window_init(NcMainWindow *window, HWND hwnd) {

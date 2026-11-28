@@ -1,14 +1,15 @@
 #pragma once
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
+#include <wchar.h>
 
-#include "config.h"
-#include "version.h"
+#include "config/config.h"
+#include "core/err.h"
+#include "core/hash.h"
+#include "core/version.h"
+#include "update/update_log.h"
 
 typedef struct {
     char *url;
@@ -46,14 +47,4 @@ bool nc_update_parse_manifest(const char *json, size_t length, NcUpdateManifest 
 NcUpdateCheckResult nc_update_check(const char *feed_url, const NcVersion *current);
 void nc_update_check_result_free(NcUpdateCheckResult *result);
 bool nc_update_download(const NcUpdateManifest *manifest, const wchar_t *destination, NcErr *err);
-
-bool nc_update_directory(wchar_t *out, size_t cap);
-bool nc_update_ensure_directory(wchar_t *out, size_t cap, NcErr *err);
-void nc_update_log(const char *message);
-bool nc_update_is_dry_run(void);
-void nc_update_payload_path(const char *version, wchar_t *out, size_t cap);
 bool nc_update_apply_self_update(const wchar_t *new_file);
-void nc_update_cleanup_old_files(void);
-
-void nc_sha256_hex(const void *data, size_t length, char out[65]);
-bool nc_sha256_file(const wchar_t *path, uint64_t *size, char out[65], NcErr *err);

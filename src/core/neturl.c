@@ -1,11 +1,14 @@
-#include "neturl.h"
+#include "core/neturl.h"
 
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+
+#include "core/str.h"
 
 static INIT_ONCE g_wsa_once = INIT_ONCE_STATIC_INIT;
 

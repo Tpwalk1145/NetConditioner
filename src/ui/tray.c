@@ -1,10 +1,11 @@
-#include "tray.h"
+#include "ui/tray.h"
 
 #include <shellapi.h>
+#include <stdlib.h>
 #include <string.h>
 
-#include "widgets.h"
-#include "win.h"
+#include "ui/widgets.h"
+#include "core/win.h"
 
 #define NC_TRAY_ID 1
 

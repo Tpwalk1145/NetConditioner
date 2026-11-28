@@ -65,8 +65,9 @@ Windows 系统级弱网模拟工具，基于 WinDivert 为 TCP/UDP 上下行流�
 
 - 留空时对系统全局 TCP/UDP 流量生效（本地回环流量除外）。
 - 最多同时选择 **64** 个进程，按进程文件名匹配（如 `chrome.exe`），同名进程会一起匹配。
-- 通过 Windows TCP/UDP 连接表映射连接与进程：每 2 秒定时刷新一次，遇到新连接也会按需刷新。
-- 受保护进程与部分系统流量可能无法获取 Owner PID；新建连接在映射刷新前可能短暂直通。
+- 通过 Windows TCP/UDP 连接表映射连接与进程：后台刷新线程每 2 秒定时刷新；遇到未知连接时仅唤醒该线程立即刷新，**收包热路径不会同步查表**。
+- 受保护进程与部分系统流量可能无法获取 Owner PID；新建连接在后台刷新完成前会短暂直通。
+- 负缓存带 TTL 与墓碑标记，未命中的连接不会反复触发刷新；刷新线程随弱网停止事件即时退出。
 
 ## 配置、停止与清理
 
@@ -113,7 +114,7 @@ Windows 系统级弱网模拟工具，基于 WinDivert 为 TCP/UDP 上下行流�
 | --- | --- | --- |
 | `NetConditioner.exe --check-update` | 普通 | 按当前配置检查一次更新，并将结果写入临时日志 |
 | `NetConditioner.exe --licenses` | 普通 | 导出内嵌的 WinDivert 许可文本至 `%TEMP%\NetConditioner\licenses\WinDivert-LICENSE-<随机id>.txt` |
-| `NetConditioner.exe --self-test` | 管理员 | 运行端到端自测（含 WinDivert 加载、配置、热键、更新/dry-run、上下行延时、进程过滤、带宽、丢包、恢复与真实网卡方向验证），日志写入 `%TEMP%\NetConditioner-selftest.log` |
+| `NetConditioner.exe --self-test` | 管理员 | 运行端到端自测：云更新回环链路、生产过滤器回环排除、上下行延时与计数、进程过滤（命中/未命中/下行/IPv6/UDP）、带宽/突发/100% 丢包与恢复、真实网卡方向验证，共 6 组用例，日志写入 `%TEMP%\NetConditioner-selftest.log` |
 
 开发联调自更新流程时，可通过环境变量启用 dry-run（不实际覆盖原 exe）：
 
@@ -176,8 +177,11 @@ build.cmd -Pause
 构建说明：
 
 - 脚本会自动通过 `vswhere` 定位 VS 2022 的 `vcvars64.bat`，并校验最终可执行文件的 PE Machine 为 x64。
-- LLVM 模式会并行调用 `clang-cl`（最多 `min(CPU 核数, 12)` 个进程）；MSVC 模式使用 `/MP`。
-- 单元测试产物为 `build\tests\NetConditionerTests.exe`，无需管理员权限、不联网、不改动真实配置。
+- **增量构建**：LLVM 模式用 `clang-cl` 生成 `.d` 头文件依赖并逐文件比对时间戳，MSVC 模式按源文件/头文件时间戳判断；编译参数变化会自动触发全量重编。无改动时整轮构建（含单元测试）约 2–3 秒。
+- LLVM 模式并行调用 `clang-cl`（最多 `min(CPU 核数, 12)` 个进程）；MSVC 模式按文件串行调用，以便精确判断每个翻译单元是否需要重编。
+- **对象文件按相对路径扁平命名**（如 `src__engine__direction.obj`），不同子目录下的同名源文件不会互相覆盖。
+- 自动生成 `build\compile_commands.json`，clangd / VS Code 等编辑器可直接索引全部翻译单元。
+- **单元测试只链接 `core` / `config` / `engine` / `update` 四层对象**，在链接期强制核心层不依赖 `ui` 与 `app`；产物为 `build\tests\NetConditionerTests.exe`，无需管理员权限、不联网、不改动真实配置。
 
 ### 构建参数
 
@@ -209,26 +213,107 @@ build.cmd -Pause
 
 > **签名与标签提示**：当前构建不对 exe 进行 Authenticode 签名（未签名程序可能触发 SmartScreen 提示，`requireAdministrator` 仅用于申请管理员权限）。如需签名，请在构建后对 exe 签名，并用签名后的文件重新计算写入 `latest.json` 的 SHA256 与大小。已发布的版本标签切勿随意移动，以免影响现有用户的云更新校验。
 
+## 架构设计
+
+### 分层依赖规则
+
+项目是严格的单向分层结构，**上层可依赖下层，下层绝不反向依赖上层**，层内模块之间同样不允许循环引用：
+
+| 层级 | 目录 | 允许依赖 | 职责边界 |
+| --- | --- | --- | --- |
+| L0 | `src/core/` | 仅 Windows SDK 与 C 运行库 | 错误、字符串、文件系统、哈希、时钟、JSON、版本、热键、URL、Win32 薄封装。**不含任何业务概念** |
+| L1 | `src/config/` | `core` | 配置数据模型、校验清洗、原子持久化与跨进程锁 |
+| L2 | `src/engine/` | `core` + `config` | WinDivert 收发、方向管线、包调度、进程过滤 |
+| L2 | `src/update/` | `core` + `config` | 更新清单校验、下载、自更新助手与后台更新服务 |
+| L3 | `src/ui/` | `core` + `config` + `engine` | 主窗口、控件、托盘与三个独立模态弹窗 |
+| L4 | `src/app/` | 全部下层 | 组合根、引擎启停编排、命令行命令实现 |
+| Entry | `src/main.c` | `app` + `update` + `core` | 进程入口、命令行分流、提权与单实例守卫 |
+
+`engine` 与 `update` 位于同一层且**互不依赖**：引擎不感知云更新，更新服务通过 `NcUpdateHost` 回调向上层索取「是否空闲 / 保存配置 / 停止引擎 / 退出重启」，因此更新层可以脱离 GUI 单独测试。
+
+### 线程模型
+
+| 线程 | 位置 | 生命周期与唤醒方式 |
+| --- | --- | --- |
+| 主 UI 线程 | `app/app.c` | 唯一的窗口消息循环，所有控件操作都在此线程 |
+| 方向接收线程 | `engine/direction.c` | 每方向 1 个，阻塞在 `WinDivertRecv`；停止时经 `WinDivertShutdown` 唤醒 |
+| 方向发送线程 | `engine/direction.c` | 仅在需要延时/抖动/限速时创建；用高精度可等待定时器等待，停止经 `stop_event` 唤醒 |
+| 进程过滤刷新线程 | `engine/process_filter.c` | 1 个后台线程，`WaitForMultipleObjects` 等待「停止事件」或「按需刷新事件」，空闲时 2 秒超时兜底 |
+| 引擎启停工作线程 | `app/engine_runner.c` | 按需创建，通过 `NcEngineEvents` 把结果 Post 回主线程 |
+| 更新检查工作线程 | `update/service.c` | 按需创建，通过更新事件总线把结果 Post 回主线程 |
+
+所有跨线程的「回到 UI」动作统一走 `PostMessageW(NC_WM_APP_EVENTS)`，**禁止在工作线程直接调用任何窗口或控件 API**。
+
+### 内存与字符串约定
+
+- **UTF-8 动态串**用 `Str`，**UTF-16 动态串与路径**用 `WStr`；两者都按需扩容。
+- **禁止固定 32K 栈缓冲**：路径拼接用 `nc_path_join_w` / `nc_path_parent_w` / `nc_temp_dir_w`，临时文件用 `nc_create_temp_file_w`，目录递归删除用 `nc_delete_tree`。源码中不应再出现 `wchar_t name[32768]` 这类声明。
+- 错误传递统一用 `NcErr` + `nc_fail(err, fmt, ...)`，函数返回 `bool`；错误消息为面向用户的中文文本。
+- 所有权约定：`*_w` 后缀函数把结果写入调用方提供的 `WStr *`（内部先清理再接管），返回 `bool`；`*_take` 函数转移所有权。
+
+### 新增代码落位指南
+
+1. 只是字符串/文件/时间/JSON 等通用能力 → `src/core/`，且该目录下的头文件**不得**包含任何上层头文件。
+2. 涉及配置字段增删 → `src/config/config.h` 与 `config.c` 的读写、清洗、校验三处同步修改，并在 `tests/test_config.c` 补用例。
+3. 影响发包行为 → `src/engine/scheduler.c`（纯算法，易单测）或 `direction.c`（I/O 驱动），前者优先。
+4. 界面新增弹窗 → 在 `src/ui/` 内实现，接收 `const NcUiHost *`，自行持有 `NcWidgets` / `NcFonts` 与 `GWLP_USERDATA` 状态，**不得包含 `app/` 头文件**。
+5. 顶层编排（去哪里、什么时候）→ `src/app/`；具体能力（怎么做）留在下层。
+
+### 架构自检
+
+单元测试**只链接 `core` / `config` / `engine` / `update`** 四层对象，因此任何核心层意外引入 `ui` 或 `app` 依赖都会直接导致链接失败——分层规则由构建系统强制执行，而非仅靠人工约定。
+
 ## 项目结构
+
+项目采用严格的单向分层架构（无循环依赖：`core` → `config` → `engine` / `update` → `ui` → `app` → `main.c`）：
 
 ```text
 src/
-├── main.c              入口与命令行参数分流
-├── app.c               应用状态机与主窗口消息循环
-├── win.c               Win32 API 薄封装
-├── util.c              UTF-8/UTF-16 转换、字符串、路径、时间与哈希
-├── json.c              JSON DOM 解析与序列化
-├── config.c            配置模型、清洗与校验
-├── store.c             配置文件读写、原子写入与损坏恢复
-├── hotkey.c            全局热键校验与格式化
-├── version.c           版本号解析与比较
-├── neturl.c            URL 安全校验、脱敏与 SHA256 规范化
-├── licenses.c          内嵌许可文本导出
-├── selftest.c          管理员端到端自测
-├── engine/             弱网引擎（WinDivert 加载、方向队列、流解析、进程过滤）
-├── ui/                 原生 Win32 界面（主窗口、控件、托盘、配置编辑、进程选择、设置）
-└── update/             云更新检查、协调调度、WinHTTP 下载与自更新助手
-tests/                  离线单元测试（无需管理员权限）
+├── core/               基础原语层（零业务依赖）
+│   ├── err.c           统一错误对象 NcErr
+│   ├── str.c           UTF-8 Str / 动态 UTF-16 WStr、编码转换与字符串列表
+│   ├── fs.c            动态宽路径拼接、目录递归清理、原子文件读写与临时文件
+│   ├── hash.c          FNV-1a 与 Windows CNG SHA256
+│   ├── time.c          单调时钟、时间格式化、PRNG 与唯一 ID
+│   ├── json.c          JSON DOM 解析、合并与序列化
+│   ├── version.c       版本号解析与比较
+│   ├── hotkey.c        全局热键校验与格式化
+│   ├── neturl.c        URL 安全校验、脱敏与 SHA256 规范化
+│   └── win.c           Win32 API 薄封装（窗口、GDI、DPI、提权与单实例互斥）
+├── config/             配置领域与持久化层
+│   ├── config.c        配置模型、进程名规范化、清洗与校验
+│   └── store.c         配置文件读写、原子替换、进程间互斥与损坏备份恢复
+├── engine/             弱网引擎层
+│   ├── flow.c          IPv4/IPv6 + TCP/UDP 数据包五元组解析与哈希
+│   ├── scheduler.c     纯算法调度器（突发丢包、带宽整形、最小堆队列与包对象池）
+│   ├── events.c        引擎事件队列与实时统计快照
+│   ├── windivert.c     WinDivert 动态释放与 API 加载
+│   ├── process_filter.c 进程枚举、异步事件刷新连接表与有界墓碑负缓存
+│   ├── direction.c     单方向收发管线（高精度可等待定时器与零忙等停止）
+│   └── engine.c        上下行弱网引擎门面
+├── update/             云更新与自更新层
+│   ├── update_log.c    更新目录安全 ACL、日志轮转与旧包清理
+│   ├── http.c          WinHTTP 安全请求与重定向校验
+│   ├── selfupdate.c    自更新助手模式、备份替换与失败回滚
+│   ├── update.c        更新清单校验与 SHA256 复核下载
+│   ├── coordinator.c   24 小时冷却与失败重试策略
+│   ├── service.c       后台异步更新服务与空闲安装状态机
+│   └── checkupdate.c   --check-update 命令行检查实现
+├── ui/                 原生 Win32 界面层（完全解耦 app，零反向依赖）
+│   ├── ui_host.c       UI 宿主上下文与公共自绘/配色处理
+│   ├── widgets.c       自绘面板/文本/按钮、数值输入与列表控件
+│   ├── tray.c          系统托盘图标、菜单与气泡通知
+│   ├── main_window.c   主窗口布局与控件构建
+│   ├── profile_editor.c 独立配置方案编辑弹窗（GWLP_USERDATA + 独立 WndProc）
+│   ├── process_selector.c 独立目标进程选择弹窗
+│   └── settings.c      独立设置弹窗（独立快捷键子类化绑定）
+├── app/                应用组合与命令层
+│   ├── engine_runner.c 引擎异步启停线程与最长运行时间控制
+│   ├── app.c           组合根、主窗口消息循环与动作编排
+│   ├── licenses.c      --licenses 许可文本导出
+│   └── selftest.c      --self-test 管理员端到端验证
+└── main.c              入口、命令行分流与管理员/单实例检查
+tests/                  离线单元测试（仅链接 core/config/engine/update，无需管理员权限）
 third_party/WinDivert/  随包内嵌的 WinDivert 2.2.2 二进制与许可
 ```
 

@@ -1,6 +1,6 @@
 #include "test_harness.h"
 
-#include "../src/json.h"
+#include "core/json.h"
 
 #include <stdlib.h>
 #include <string.h>
